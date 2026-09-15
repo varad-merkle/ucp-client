@@ -1,0 +1,57 @@
+{
+  "ucp": {
+    "version": "2026-04-08",
+    "capabilities": {
+      "dev.ucp.shopping.catalog.search": [{
+        "version": "2026-04-08",
+        "spec": "https://ucp.dev/2026-04-08/specification/catalog/search",
+        "schema": "https://ucp.dev/2026-04-08/schemas/shopping/catalog_search.json"
+      }],
+      "dev.ucp.shopping.catalog.lookup": [
+        {
+          "version": "2026-04-08",
+          "spec": "https://ucp.dev/2026-04-08/specification/catalog/lookup",
+          "schema": "https://ucp.dev/2026-04-08/schemas/shopping/catalog_lookup.json"
+        }
+      ],
+      "dev.ucp.shopping.checkout": [
+        {
+          "version": "2026-04-08",
+          "spec": "https://ucp.dev/2026-04-08/specification/shopping/checkout",
+          "schema": "https://ucp.dev/2026-04-08/schemas/shopping/checkout.json"
+        }
+      ],
+      "dev.ucp.shopping.order": [
+        {
+          "version": "2026-04-08",
+          "spec": "https://ucp.dev/2026-04-08/specification/shopping/order",
+          "schema": "https://ucp.dev/2026-04-08/schemas/shopping/order.json"
+        }
+      ]
+    },
+    "payment_handlers": {
+      "dev.shopify.shop_pay": [
+        {
+          "id": "shop_pay",
+          "version": "2026-01-11",
+          "spec": "https://shopify.dev/docs/agents/checkout/shop-pay-handler",
+          "config_schema": "https://shopify.dev/ucp/shop-pay-handler/2026-01-11/config.json",
+          "instrument_schemas": [
+            "https://shopify.dev/ucp/shop-pay-handler/2026-01-11/instrument.json"
+          ]
+        }
+      ],
+      "com.google.pay": [
+        {
+          "id": "gpay",
+          "version": "2026-01-11",
+          "spec": "https://pay.google.com/gp/p/ucp/2026-01-11/",
+          "config_schema": "https://pay.google.com/gp/p/ucp/2026-01-11/schemas/config.json",
+          "instrument_schemas": [
+            "https://pay.google.com/gp/p/ucp/2026-01-11/schemas/card_payment_instrument.json"
+          ]
+        }
+      ]
+    }
+  }
+}
