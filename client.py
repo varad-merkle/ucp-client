@@ -6,7 +6,8 @@ from mcp import Client
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from mcp_types import TextContent
-from ucp_sdk.models.schemas.shopping.catalog_search import SearchRequest, SearchResponse
+from ucp_sdk.models.schemas.shopping.catalog_lookup import LookupRequest, GetProductRequest
+from ucp_sdk.models.schemas.shopping.catalog_search import SearchRequest
 import json
 import uuid
 import config
@@ -54,6 +55,7 @@ MERCHANTS_CONFIG = [
 # SERVER_URL = "https://108puzzles.com"
 SERVER_URL = "http://localhost:8000"
 public_url = ngrok.connect(addr="7000")
+mcp_metadata = config.get_mcp_metadata()
 
 app = FastAPI()
 
@@ -132,10 +134,10 @@ async def search_products(search_req: SearchRequest, merchant_id: str | None = N
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
-@app.post("/api/search/mcp")
-async def search_products_mcp(query: QueryMCP):
+@app.post("/api/mcp/catalog/search/")
+async def search_products_mcp(query: SearchRequest):
     """ Search products via an MCP client """
-    search_args = config.get_mcp_metadata()
+    search_args = mcp_metadata
     search_args["catalog"] = {
         "query": query.query
     }
@@ -148,6 +150,68 @@ async def search_products_mcp(query: QueryMCP):
                 search_response_dict = json.loads(block.text)
                 if search_response_dict.get("products"):
                     return search_response_dict.get("products")
+        return None
+
+@app.post("/api/mcp/catalog/lookup")
+async def lookup_products_mcp(request: LookupRequest):
+    """
+    Lookup one or more products via an MCP client.
+    Requires a list of one or more valid product IDs.
+    The response from the MCP server can be one of three possible options:
+        1. Success: A list of one or more products.
+        2. Partial success: Not all specified products were found. Mesages data indicates which products could not be found and why.
+        3. Error: Not a single product specified by the product IDs could be found.
+    """
+    lookup_args = mcp_metadata
+    # Extract unique product IDs for lookup
+    unique_product_ids = set(request.ids)
+    lookup_args["catalog"] = {
+        "ids": unique_product_ids
+    }
+    async with Client(MCP_CLIENT_URL) as mcp_client:
+        lookup_response = await mcp_client.call_tool("lookup_catalog", lookup_args)
+        for block in lookup_response.content:
+            if isinstance(block, TextContent):
+                print(block)
+                lookup_response_dict = json.loads(block.text)
+                products = lookup_response_dict.get("products")
+                messages = lookup_response_dict.get("messages")
+                if len(messages) > 0 and len(products) == 0:
+                    print("No products found. Ensure entered IDs are valid.")
+                    return messages
+                elif len(products) > 0 and len(messages) == 0:
+                    return products
+                else:
+                    print("Product search returned partial results. Some IDs are invalid.")
+                    for message in messages:
+                        print(f"Type: {message.get('type')}, Code: {message.get('code')}, Content: {message.get('message')}")
+                    return {
+                        "products": products,
+                        "messages": messages
+                    }
+        return None
+
+@app.post("/api/mcp/catalog/product")
+async def get_product_detail(request: GetProductRequest):
+    pid = request.id
+    get_product_args = mcp_metadata
+    get_product_args["catalog"] = {
+        "id": pid
+    }
+
+    async with Client(MCP_CLIENT_URL) as mcp_client:
+        get_product_response = await mcp_client.call_tool("get_product", get_product_args)
+        for block in get_product_response.content:
+            if isinstance(block, TextContent):
+                print(block)
+                product_detail_response_dict = json.loads(block.text)
+                product = product_detail_response_dict.get("product")
+                messages = product_detail_response_dict.get("messages")
+                if len(messages) > 0 and len(product) == 0:
+                    print("No products found. Ensure entered IDs are valid.")
+                    return messages
+                elif len(product) > 0 and len(messages) == 0:
+                    return product_detail_response_dict.get("product")
         return None
 
 

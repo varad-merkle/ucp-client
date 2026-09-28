@@ -1,9 +1,11 @@
 import logging
 from urllib import response
+from pyngrok import ngrok
+from load_dotenv import load_dotenv
 
 import httpx
 import sys
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from ucp_sdk.models.schemas.shopping.catalog_lookup import Product
 from ucp_sdk.models.schemas.shopping.catalog_search import SearchRequest, SearchResponse
@@ -11,8 +13,11 @@ import json
 import uuid
 import config
 
-SERVER_URL = "http://localhost:8000"
+load_dotenv()
 
+# SERVER_URL = "http://localhost:8000"
+SERVER_URL = "https://108puzzles.com/"
+public_url = ngrok.connect(addr="7000")
 app = FastAPI()
 
 app.add_middleware(
@@ -22,18 +27,32 @@ app.add_middleware(
     allow_methods=["*"],
 )
 
-@app.get("/profile")
-async def get_agent_profile():
+
+# def connect_ngrok():
+#     forwarder = ngrok.forward(
+#         "localhost:8085",
+#         authtoken_from_env=True,
+#         domain="moneywise-elective-anthem.ngrok-free.dev"
+#     )
+#     print(f"Available at: {forwarder.url()}")
+#
+#
+# connect_ngrok()
+
+@app.get("/profile.json")
+async def get_agent_profile(response: Response):
+    response.headers["Cache-Control"] = "public, max-age=3600"
     with config.PROFILE_PATH.open(encoding="utf-8") as f:
         template = f.read()
 
     profile = json.loads(template)
-    return profile
-
+    response.body = profile
+    return response.body
 
 def get_headers() -> dict[str, str]:
     """Generate necessary headers for UCP requests"""
     headers = {"idempotency-key": str(uuid.uuid4()), "request-id": str(uuid.uuid4()),
+               "Cache-Control": "public, max-age=3600",
                "UCP-Agent": f'profile="http://localhost:7000/profile"; version={config.get_version()}'}
     return headers
 
@@ -43,6 +62,7 @@ def main() -> int:
     )
 
     logger = logging.getLogger(__name__)
+    logger.info(f"Public Client URL: {public_url}")
 
     client = httpx.Client(base_url=SERVER_URL)
 
