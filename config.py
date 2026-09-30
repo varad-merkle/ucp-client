@@ -7,8 +7,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("config")
 
-PUBLIC_URL = "https://moneywise-elective-anthem.ngrok-free.dev"
-
 PROFILE_PATH = Path(__file__).parent / "profile.json"
 
 def get_profile_data():
@@ -25,12 +23,3 @@ def get_profile_data():
 def get_version():
     profile = get_profile_data()
     return profile["ucp"]["version"]
-
-def get_mcp_metadata() -> dict:
-    return {
-        "meta": {
-            "ucp-agent": {
-                "profile": f"{PUBLIC_URL}/profile.json"
-            }
-        }
-    }
