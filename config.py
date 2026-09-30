@@ -1,13 +1,17 @@
 import json
 import logging
+import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("config")
 
-PUBLIC_URL = "https://moneywise-elective-anthem.ngrok-free.dev"
+PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:7000")
 
 PROFILE_PATH = Path(__file__).parent / "profile.json"
 
@@ -26,11 +30,13 @@ def get_version():
     profile = get_profile_data()
     return profile["ucp"]["version"]
 
-def get_mcp_metadata() -> dict:
+def get_mcp_metadata(dynamic_url:str =None) -> dict:
+
+    base_url=dynamic_url or PUBLIC_URL
     return {
         "meta": {
             "ucp-agent": {
-                "profile": f"{PUBLIC_URL}/profile.json"
+                "profile": f"{base_url}/profile.json"
             }
         }
     }

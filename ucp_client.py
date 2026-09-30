@@ -1,7 +1,7 @@
 import logging
 from urllib import response
 from pyngrok import ngrok
-from load_dotenv import load_dotenv
+from dotenv import load_dotenv
 
 import httpx
 import sys
@@ -17,7 +17,7 @@ load_dotenv()
 
 # SERVER_URL = "http://localhost:8000"
 SERVER_URL = "https://108puzzles.com/"
-public_url = ngrok.connect(addr="7000")
+public_url = ngrok.connect(addr="127.0.0.1:7000")
 app = FastAPI()
 
 app.add_middleware(
