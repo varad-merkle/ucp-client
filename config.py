@@ -3,7 +3,7 @@ import logging
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-
+from fastapi import HTTPException
 load_dotenv()
 
 logging.basicConfig(
@@ -40,3 +40,17 @@ def get_mcp_metadata(dynamic_url:str =None) -> dict:
             }
         }
     }
+
+
+def extract_mcp_endpoint(business_profile:dict)->str:
+     services=business_profile.get("ucp",{}).get("services",{}).get("dev.ucp.shopping", [])
+     for service in services:
+        if service.get("transport") == "mcp" and service.get("endpoint"):
+            return service["endpoint"].rstrip("/")
+
+     available = [s.get("transport") for s in services]
+     raise HTTPException(
+        status_code=400,
+        detail=f"Merchant does not expose an MCP transport endpoint (available: {available})",
+    ) 
+

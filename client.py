@@ -1,19 +1,23 @@
 import logging
 import httpx
 import sys
-
+from fastapi import HTTPException
 from mcp import Client
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from mcp_types import TextContent
 from ucp_sdk.models.schemas.shopping.catalog_lookup import LookupRequest, GetProductRequest
 from ucp_sdk.models.schemas.shopping.catalog_search import SearchRequest
+from ucp_sdk.models.schemas.shopping.cart_create_request import CartCreateRequest
+from ucp_sdk.models.schemas.shopping.cart_update_request import CartUpdateRequest
 import json
 import uuid
 import config
 from pyngrok import ngrok
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
+
 
 load_dotenv()
 
@@ -22,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MCP_CLIENT_URL = "https://p1-dev.myshopify.com/api/ucp/mcp"
+
 class QueryMCP(BaseModel):
     query: str
 
@@ -36,17 +40,16 @@ class CartContextRequest(BaseModel):
     address_region: str | None = None
     postal_code: str | None = None
 
-class CreateCartRequest(BaseModel):
-    items:list[CartItemRequest]
-    context: CartContextRequest | None = None
+# class CreateCartRequest(BaseModel):
+#     items:list[CartItemRequest]
+#     context: CartContextRequest | None = None
 
 class GetCartRequest(BaseModel):
      id:str
 
-class UpdateCartRequest(BaseModel):
-    id: str  
-    items: list[CartItemRequest]
-    context: CartContextRequest | None = None
+class MCPUpdateCartRequest(BaseModel):
+    id: str
+    cart: CartUpdateRequest
 
 class CancelCartRequest(BaseModel):
     id: str  
@@ -76,14 +79,44 @@ MERCHANTS_CONFIG = [
     }
 ]
 
+BUSINESS_BASE_URL = "https://www.pier1.com"
 # SERVER_URL = "https://108puzzles.com"
 SERVER_URL = "http://localhost:8000"
-ngrok_tunnel = ngrok.connect(addr="7000")
-public_url = ngrok_tunnel.public_url
-print(f"Ngrok Tunnel active at: {public_url}")
-mcp_metadata = config.get_mcp_metadata(dynamic_url=public_url)
+# ngrok_tunnel = ngrok.connect(addr="7000")
+# public_url = ngrok_tunnel.public_url
+MCP_CLIENT_URL: str | None = None
+public_url: str | None = None
+mcp_metadata: dict = {}
 
-app = FastAPI()
+
+async def fetch_business_profile(base_url: str) -> dict:
+    url = f"{base_url.rstrip('/')}/.well-known/ucp"
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        resp = await http.get(url, headers={"Accept": "application/json"})
+        resp.raise_for_status()
+        return resp.json()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global MCP_CLIENT_URL, public_url, mcp_metadata
+
+    # 1. start the tunnel
+    ngrok_tunnel = ngrok.connect(addr="7000")
+    public_url = ngrok_tunnel.public_url
+    logger.info(f"Ngrok Tunnel active at: {public_url}")
+
+    # 2. build your own platform metadata
+    mcp_metadata = config.get_mcp_metadata(dynamic_url=public_url)
+
+    # 3. fetch the business's profile and find its MCP endpoint
+    profile = await fetch_business_profile(BUSINESS_BASE_URL)
+    MCP_CLIENT_URL = config.extract_mcp_endpoint(profile)
+    logger.info(f"Discovered MCP endpoint: {MCP_CLIENT_URL}")
+
+    yield   # ← server now starts accepting requests
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -245,7 +278,7 @@ async def get_product_detail(request: GetProductRequest):
         return None
 
 @app.post("/api/mcp/cart/create")
-async def create_cart_mcp(request: CreateCartRequest):
+async def create_cart_mcp(request: CartCreateRequest):
     """
     Create a new cart via an MCP client.
     Expects a list of Variant IDs and quantities.
@@ -253,42 +286,20 @@ async def create_cart_mcp(request: CreateCartRequest):
 
     cart_args=dict(mcp_metadata)
 
-    line_items=[]
-    for req_item in request.items:
-        line_items.append(
-            {
-                "item":
-                {
-                    "id":req_item.id
-                },
-                "quantity":req_item.quantity
-                
-            })
-
-        cart_payload={
-            "line_items":line_items
-        }
-
-        if request.context:
-        # exclude_none=True ensures we only send fields you actually provided
-            cart_payload["context"] = request.context.model_dump(exclude_none=True)
-
-        cart_args["cart"] = cart_payload
-
-        logger.info(f"Creating cart with args: {json.dumps(cart_args, indent=2)}")
-        try:
+    cart_args["cart"]=request.model_dump(mode="json",exclude_none=True)
+    print("cart_args", cart_args)
+    
+    try:
             async with Client(MCP_CLIENT_URL) as mcp_client:
         
                 cart_response=await mcp_client.call_tool("create_cart",cart_args)
 
                 for block in cart_response.content:
                     if isinstance(block,TextContent):
-                        cart_response_dict=json.loads(block.text)
-                        print("Cart response dict",cart_response_dict)
-                        return cart_response_dict
+                        return json.loads(block.text)
                 return {"error": "No valid response from MCP server"}
 
-        except Exception as exc:
+    except Exception as exc:
             logger.exception("MCP cart creation failed")
             raise HTTPException(status_code=502, detail=f"Cart creation failed: {exc}") from exc
 
@@ -322,50 +333,31 @@ async def get_cart_mcp(request:GetCartRequest):
 
 
 @app.post("/api/mcp/cart/update")
-async def update_cart_mcp(request:UpdateCartRequest):
+async def update_cart_mcp(request:MCPUpdateCartRequest):
         """
     Update an existing cart via an MCP client.
     Note: The line_items array acts as a full replacement of the cart's contents.
     """
         cart_args=dict(mcp_metadata)
-
-        cart_args["id"]=request.id
-
-        line_items = []
-        for req_item in request.items:
-            line_items.append({
-                "item": {
-                    "id": req_item.id
-                },
-                "quantity": req_item.quantity
-            })
-        
-        cart_payload = {
-        "line_items": line_items
-                  }
-
-        if request.context:
-           cart_payload["context"] = request.context.model_dump(exclude_none=True)
-
-        cart_args["cart"] = cart_payload
-        logger.info(f"Updating cart with args: {json.dumps(cart_args, indent=2)}")
-
+        cart_args["id"] = request.id
+        cart_args["cart"] = request.cart.model_dump(mode="json", exclude_none=True)
+        logger.info(f"Updating cart with validated SDK args: {json.dumps(cart_args, indent=2)}")
+    
         try:
             async with Client(MCP_CLIENT_URL) as mcp_client:
-                # Call the update_cart tool
                 cart_response = await mcp_client.call_tool("update_cart", cart_args)
                 
                 for block in cart_response.content:
                     if isinstance(block, TextContent):
-                        cart_response_dict = json.loads(block.text)
-                        return cart_response_dict
+                        return json.loads(block.text)
                         
                 return {"error": "No valid response from MCP server"}
             
         except Exception as exc:
-            logger.exception("MCP cart update failed")
-            raise HTTPException(status_code=502, detail=f"Cart update failed: {exc}") from exc
+                logger.exception("MCP cart update failed")
+                raise HTTPException(status_code=502, detail=f"Cart update failed: {exc}") from exc
 
+        
 @app.post("/api/mcp/cart/cancel")
 async def cancel_cart_mcp(request: CancelCartRequest):
     """
