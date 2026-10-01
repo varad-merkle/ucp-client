@@ -6,17 +6,20 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from load_dotenv import load_dotenv
 from mcp import Client
 from mcp_types import TextContent
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from pyngrok import ngrok
 from pyngrok.exception import PyngrokNgrokHTTPError
 from ucp_sdk.models.schemas.shopping.catalog_lookup import GetProductRequest, LookupRequest
 from ucp_sdk.models.schemas.shopping.catalog_search import SearchRequest
+from ucp_sdk.models.schemas.shopping.cart_create_request import Checkout as CartCheckoutCreateRequest
+from ucp_sdk.models.schemas.shopping.checkout_complete_request import CheckoutCompleteRequest
+from ucp_sdk.models.schemas.shopping.checkout_update_request import CheckoutUpdateRequest
 
 import config
 from chat import Chat
@@ -70,6 +73,11 @@ TOOL_CAPABILITIES = {
     "search_catalog": "dev.ucp.shopping.catalog.search",
     "lookup_catalog": "dev.ucp.shopping.catalog.lookup",
     "get_product": "dev.ucp.shopping.catalog.lookup",
+    "create_checkout": "dev.ucp.shopping.checkout",
+    "get_checkout": "dev.ucp.shopping.checkout",
+    "update_checkout": "dev.ucp.shopping.checkout",
+    "complete_checkout": "dev.ucp.shopping.checkout",
+    "cancel_checkout": "dev.ucp.shopping.checkout",
 }
 
 # The store fetches our profile from this public URL before answering any call.
@@ -153,10 +161,16 @@ def log_exchange(tool: str, arguments: dict, started: float, status: int, respon
     del exchanges[MAX_EXCHANGES:]
 
 
-async def call_mcp(tool: str, catalog: dict) -> dict:
-    """Call one of the store's UCP MCP tools and return its JSON result."""
-    arguments = {"meta": {"ucp-agent": {"profile": profile_url}}, "catalog": catalog}
-    logger.info(f"  -> {tool} {json.dumps(catalog)}")
+def mcp_metadata(require_idempotency_key: bool = False) -> dict:
+    meta = {"ucp-agent": {"profile": profile_url}}
+    if require_idempotency_key:
+        meta["idempotency-key"] = str(uuid.uuid4())
+    return {"meta": meta}
+
+
+async def call_mcp_arguments(tool: str, arguments: dict, payload: dict) -> dict:
+    """Call one UCP MCP tool and return its JSON result."""
+    logger.info(f"  -> {tool} {json.dumps(payload)}")
     started = time.perf_counter()
     try:
         async with Client(MCP_CLIENT_URL) as mcp_client:
@@ -172,6 +186,18 @@ async def call_mcp(tool: str, catalog: dict) -> dict:
     elapsed = round((time.perf_counter() - started) * 1000)
     logger.info(f"  <- {tool} OK in {elapsed} ms: {summarize(response)}")
     return response
+
+
+async def call_mcp(tool: str, catalog: dict) -> dict:
+    """Call a catalog UCP MCP tool and return its JSON result."""
+    arguments = {**mcp_metadata(), "catalog": catalog}
+    return await call_mcp_arguments(tool, arguments, catalog)
+
+
+async def call_checkout_mcp(tool: str, payload: dict, require_idempotency_key: bool = False) -> dict:
+    """Call a UCP Checkout MCP tool and return its JSON result."""
+    arguments = {**mcp_metadata(require_idempotency_key), **payload}
+    return await call_mcp_arguments(tool, arguments, payload)
 
 
 async def fetch_store_profile() -> dict:
@@ -283,6 +309,54 @@ async def get_product_detail(request: GetProductRequest):
         return response["product"]
     logger.info("No products found. Ensure entered IDs are valid.")
     return response.get("messages") or []
+
+
+class CheckoutFromCartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cart_id: str
+
+
+@app.post("/api/mcp/checkout/create")
+async def create_checkout(request: CartCheckoutCreateRequest | CheckoutFromCartRequest):
+    if isinstance(request, CheckoutFromCartRequest):
+        checkout = CartCheckoutCreateRequest.model_validate({
+            "cart_id": request.cart_id,
+            "line_items": [],
+        })
+    else:
+        checkout = request
+    payload = checkout.model_dump(mode="json", by_alias=True, exclude_none=True)
+    return await call_checkout_mcp("create_checkout", {"checkout": payload})
+
+
+@app.post("/api/mcp/checkout/get")
+async def get_checkout(id: str = Body(..., embed=True)):
+    return await call_checkout_mcp("get_checkout", {"id": id})
+
+
+@app.post("/api/mcp/checkout/update")
+async def update_checkout(id: str = Body(...), checkout: CheckoutUpdateRequest = Body(...)):
+    checkout_payload = checkout.model_dump(mode="json", by_alias=True, exclude_none=True)
+    return await call_checkout_mcp(
+        "update_checkout", {"id": id, "checkout": checkout_payload}
+    )
+
+
+@app.post("/api/mcp/checkout/complete")
+async def complete_checkout(id: str = Body(...), checkout: CheckoutCompleteRequest = Body(...)):
+    checkout_payload = checkout.model_dump(mode="json", by_alias=True, exclude_none=True)
+    return await call_checkout_mcp(
+        "complete_checkout",
+        {"id": id, "checkout": checkout_payload},
+        require_idempotency_key=True,
+    )
+
+
+@app.post("/api/mcp/checkout/cancel")
+async def cancel_checkout(id: str = Body(..., embed=True)):
+    return await call_checkout_mcp(
+        "cancel_checkout", {"id": id}, require_idempotency_key=True
+    )
 
 
 # Endpoints for the chat frontend (ucp-frontend)
