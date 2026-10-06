@@ -1,4 +1,4 @@
-"""Chat for the shopping frontend, built on the UCP catalog and cart tools.
+"""Chat for the shopping frontend, built on the UCP catalog, cart and checkout tools.
 
 The rules are simple and deterministic (no LLM):
 
@@ -12,11 +12,17 @@ The rules are simple and deterministic (no LLM):
     "make the <cart item> 3"             -> update_cart with the new quantity
     "remove the <cart item>"             -> update_cart without that line
     "what's in my cart?"                 -> get_cart
+    "checkout"                           -> create_checkout from the cart
+    "my email is ..." / "my phone is ..." /
+    "my name is ..." / "ship to <address>" -> update_checkout with those details
+    "Standard"                           -> update_checkout selecting that delivery option
+    "cancel checkout"                    -> cancel_checkout
 
-Checkout is not enabled yet; the cart stops at viewing and editing.
+Orders are not placed from the chat: payment happens on the store's own checkout
+page, through the checkout's continue_url (UCP's hand-off for requires_escalation).
 
 Each reply is a list of blocks (text, notice, products, product, capabilities,
-cart) in the shape the frontend expects (see ucp-frontend/src/lib/types.ts).
+cart, checkout) in the shape the frontend expects (see ucp-frontend/src/lib/types.ts).
 """
 
 import html
@@ -37,6 +43,14 @@ SET_QTY_RE = re.compile(r"^\s*make the (?P<title>.+?) (?P<qty>\d+)\s*$", re.I)
 REMOVE_RE = re.compile(r"^\s*remove (?:the )?(?P<title>.+?)(?: from (?:my |the )?cart)?\s*$", re.I)
 EMPTY_CART_RE = re.compile(r"^\s*(empty|clear) (my |the )?cart\b", re.I)
 VIEW_CART_RE = re.compile(r"\b(what'?s in my cart|(show|view|see|open) (me )?(my |the )?cart|my cart)\b", re.I)
+CANCEL_CHECKOUT_RE = re.compile(r"^\s*cancel (the |my )?checkout\b", re.I)
+VIEW_CHECKOUT_RE = re.compile(r"\b((show|view|see) (me )?(my |the )?checkout|checkout status)\b", re.I)
+START_CHECKOUT_RE = re.compile(r"^\s*(proceed to |go to |start )?(checkout|check out)\s*[.!]?\s*$", re.I)
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
+PHONE_RE = re.compile(r"\bphone(?: number)?(?: is)?\s*:?\s*(?P<phone>\+?\(?\d[\d\s().-]{6,}\d)", re.I)
+NAME_RE = re.compile(r"\bmy name is (?P<first>[A-Za-z'-]+)(?: (?!and\b)(?P<last>[A-Za-z'-]+))?", re.I)
+ADDRESS_RE = re.compile(r"^\s*(?:ship|deliver|send)(?: it)? to (?P<address>.+?)\s*[.!]?\s*$", re.I)
+US_ADDRESS_RE = re.compile(r"^(?P<street>[^,]+),\s*(?P<city>[^,]+),\s*(?P<region>[A-Za-z]{2})\s+(?P<postal>\d{5}(?:-\d{4})?)$")
 COMMERCE_RE = re.compile(r"\b(checkout|check out|pay|payment|order)\b", re.I)
 MORE_RE = re.compile(r"^\s*(show |load |see )?(more|next( page)?)\s*[.!]?\s*$", re.I)
 OPTION_RE = re.compile(r"^\s*in (?P<label>.{1,40}?)\s*$", re.I)
@@ -69,6 +83,12 @@ class Session:
     next_cursor: str | None = None
     detail: dict | None = None  # last product shown in detail
     cart: dict | None = None  # the store's last cart response
+    checkout: dict | None = None  # the store's last checkout response
+    # What the shopper told us for checkout. UCP update_checkout is a full
+    # replacement, so these are sent again with every update.
+    buyer: dict = field(default_factory=dict)
+    address: dict = field(default_factory=dict)
+    delivery_option: str | None = None
 
 
 # ------------------------------------------------------------------ blocks
@@ -221,13 +241,82 @@ def cart_block(cart: dict | None) -> dict:
     }
 
 
-def cart_state(cart: dict | None) -> dict:
+def cart_state(cart: dict | None, checkout: dict | None = None) -> dict:
     """The cart summary the frontend shows in the top bar and sidebar."""
     cart = cart or {}
     return {
         **EMPTY_STATE,
         "cart_count": sum(line["quantity"] for line in cart.get("line_items") or []),
         "cart_subtotal": total_of(cart.get("totals"), "subtotal"),
+        "checkout_id": (checkout or {}).get("id"),
+    }
+
+
+def shipping_method(checkout: dict) -> dict:
+    return next((m for m in (checkout.get("fulfillment") or {}).get("methods") or [] if m.get("type") == "shipping"), {})
+
+
+def checkout_block(checkout: dict) -> dict:
+    """A UCP checkout as the frontend's checkout card."""
+    method = shipping_method(checkout)
+    destination = next((d for d in method.get("destinations") or [] if d.get("id") == method.get("selected_destination_id")),
+                       (method.get("destinations") or [{}])[0])
+    group = (method.get("groups") or [{}])[0]
+    return {
+        "type": "checkout",
+        "checkout": {
+            "id": checkout["id"],
+            "status": checkout.get("status", ""),
+            "currency": checkout.get("currency", "USD"),
+            "line_items": [
+                {
+                    "id": line["id"],
+                    "title": line["item"].get("title", ""),
+                    "image": line["item"].get("image_url"),
+                    "price": line["item"].get("price", 0),
+                    "quantity": line["quantity"],
+                    "line_total": total_of(line.get("totals"), "total") or line["item"].get("price", 0) * line["quantity"],
+                }
+                for line in checkout.get("line_items") or []
+            ],
+            "totals": checkout.get("totals") or [],
+            "buyer": checkout.get("buyer") or {},
+            "address": {k: v for k, v in destination.items()
+                        if k in ("street_address", "address_locality", "address_region", "postal_code")},
+            "shipping_options": [
+                {
+                    "id": option["id"],
+                    "title": option.get("title", ""),
+                    "description": plain_text(option.get("description")),
+                    "amount": total_of(option.get("totals"), "total"),
+                }
+                for option in group.get("options") or []
+            ],
+            "selected_shipping_id": group.get("selected_option_id"),
+            "instruments": [
+                {"id": i.get("id", ""), "label": i.get("display", {}).get("brand") or i.get("handler_id", ""),
+                 "handler": i.get("handler_id", ""), "selected": bool(i.get("selected"))}
+                for i in (checkout.get("payment") or {}).get("instruments") or []
+            ],
+            "messages": [{"type": m.get("type", "info"), "code": m.get("code"), "content": m.get("content", "")}
+                         for m in checkout.get("messages") or []],
+            "links": checkout.get("links") or [],
+            "continue_url": checkout.get("continue_url"),
+        },
+    }
+
+
+def parse_address(text: str) -> dict | None:
+    """'123 Main St, Springfield, IL 62701' -> UCP postal address fields (US addresses)."""
+    match = US_ADDRESS_RE.match(text.strip())
+    if not match:
+        return None
+    return {
+        "street_address": match["street"].strip(),
+        "address_locality": match["city"].strip(),
+        "address_region": match["region"].upper(),
+        "postal_code": match["postal"],
+        "address_country": "US",
     }
 
 
@@ -291,10 +380,10 @@ def dollars(cents: int) -> str:
 
 
 class Chat:
-    def __init__(self, call_tool: CallTool, call_cart_tool: CallTool, fetch_store_profile: FetchProfile,
+    def __init__(self, call_tool: CallTool, call_store_tool: CallTool, fetch_store_profile: FetchProfile,
                  store_name: str, currency: str, country: str):
         self.call_tool = call_tool  # catalog tools: (tool, catalog parameters)
-        self.call_cart_tool = call_cart_tool  # cart tools: (tool, tool arguments)
+        self.call_store_tool = call_store_tool  # cart and checkout tools: (tool, tool arguments)
         self.fetch_store_profile = fetch_store_profile
         self.store_name = store_name
         self.currency = currency
@@ -317,10 +406,14 @@ class Chat:
         try:
             blocks, suggestions = await self.route(message.strip(), session)
         except Exception as exc:
-            blocks = [notice("error", f"The store could not be reached: {exc}")]
+            if "rate limit" in str(exc).lower():
+                blocks = [notice("warning", "The store is getting too many requests right now. "
+                                            "Wait a few seconds and try again.")]
+            else:
+                blocks = [notice("error", f"The store could not be reached: {exc}")]
             suggestions = ["Try again"]
         return {"session_id": session.id, "blocks": blocks, "suggestions": suggestions,
-                "state": cart_state(session.cart)}
+                "state": cart_state(session.cart, session.checkout)}
 
     async def route(self, message: str, session: Session) -> tuple[list[dict], list[str]]:
         if not message or GREETING_RE.match(message):
@@ -346,9 +439,30 @@ class Chat:
         if VIEW_CART_RE.search(message):
             return await self.view_cart(session)
 
+        if START_CHECKOUT_RE.match(message):
+            return await self.start_checkout(session)
+
+        if CANCEL_CHECKOUT_RE.match(message):
+            return await self.cancel_checkout(session)
+
+        if session.checkout:
+            if VIEW_CHECKOUT_RE.search(message):
+                return await self.view_checkout(session)
+            if (match := ADDRESS_RE.match(message)) and not parse_address(match["address"]):
+                return [text("Please give the address as *street, city, state ZIP*, "
+                             "for example *ship to 123 Main St, Springfield, IL 62701*.")], []
+            if details := self.checkout_details(session, message):
+                return await self.update_checkout(session, details)
+            if option := self.find_delivery_option(session, message):
+                session.delivery_option = option["id"]
+                return await self.update_checkout(session, f"delivery: {option.get('title')}")
+
         if COMMERCE_RE.search(message):
-            return [notice("info", "Checkout isn't enabled in this assistant yet. "
-                                   "You can view and edit your cart.")], ["What's in my cart?"]
+            # "Pay by ...", "Place the order": payment happens on the store's own checkout page.
+            if session.checkout and session.checkout.get("continue_url"):
+                return [text(f"Payment and placing the order happen on {self.store_name}'s own checkout page: "
+                             f"[Continue to payment on {self.store_name}]({session.checkout['continue_url']})")], []
+            return [notice("info", "Add something to your cart first, then choose Checkout.")], ["What's in my cart?"]
 
         if MORE_RE.match(message):
             return await self.more(session)
@@ -533,16 +647,17 @@ class Chat:
         """
         items = [{"item": {"id": variant_id}, "quantity": qty} for variant_id, qty in dict(lines).items()]
         cart = {"line_items": items, "context": self.cart_context}
+        session.checkout = None  # an open checkout no longer matches the cart; Checkout starts a new one
 
         response = None
         if session.cart:
-            response = await self.call_cart_tool("update_cart", {"id": session.cart["id"], "cart": cart})
+            response = await self.call_store_tool("update_cart", {"id": session.cart["id"], "cart": cart})
             if is_not_found(response):  # expired or cancelled on the store's side; start a new cart
                 session.cart = response = None
         if not session.cart:
             if not items:
                 return [text("Your cart is empty."), cart_block(None)], ["Show me floor lamps"]
-            response = await self.call_cart_tool("create_cart", {"cart": cart})
+            response = await self.call_store_tool("create_cart", {"cart": cart})
 
         if response.get("ucp", {}).get("status") == "error" or not response.get("id"):
             failed = notices(response.get("messages")) or [notice("error", "The store couldn't update the cart.")]
@@ -555,7 +670,7 @@ class Chat:
         if not session.cart:
             return [text("Your cart is empty."), cart_block(None)], ["Show me floor lamps"]
 
-        response = await self.call_cart_tool("get_cart", {"id": session.cart["id"]})
+        response = await self.call_store_tool("get_cart", {"id": session.cart["id"]})
         if is_not_found(response):
             session.cart = None
             return [text("Your cart has expired, so it's empty now."), cart_block(None)], ["Show me floor lamps"]
@@ -574,6 +689,149 @@ class Chat:
         #     blocks.append(text(f"[Check out on {self.store_name}]({response['continue_url']})"))
 
         return blocks, []
+
+    # ----------------------------------------------------------- checkout
+
+    async def start_checkout(self, session: Session):
+        if not cart_state(session.cart)["cart_count"]:
+            return [text("Your cart is empty. Add something first, then choose Checkout.")], ["Show me floor lamps"]
+
+        # UCP: a checkout can be created from the cart; the store takes the items from it.
+        response = await self.call_store_tool(
+            "create_checkout", {"checkout": {"cart_id": session.cart["id"], "line_items": []}}
+        )
+        if is_not_found(response):
+            session.cart = None
+            return [text("Your cart has expired, so there is nothing to check out.")], ["Show me floor lamps"]
+
+        session.delivery_option = None
+        if response.get("id") and (session.buyer or session.address):
+            # Reuse details the shopper already gave in this chat.
+            session.checkout = response
+            response = await self.call_store_tool(
+                "update_checkout", {"id": response["id"], "checkout": self.checkout_payload(session)}
+            )
+        return self.checkout_reply(session, response, "Here's your checkout:")
+
+    async def view_checkout(self, session: Session):
+        response = await self.call_store_tool("get_checkout", {"id": session.checkout["id"]})
+        return self.checkout_reply(session, response, "Here's your checkout:")
+
+    async def update_checkout(self, session: Session, saved: str):
+        response = await self.call_store_tool(
+            "update_checkout", {"id": session.checkout["id"], "checkout": self.checkout_payload(session)}
+        )
+        return self.checkout_reply(session, response, f"Saved {saved}.")
+
+    async def cancel_checkout(self, session: Session):
+        if not session.checkout:
+            return [text("There's no checkout open.")], ["What's in my cart?"]
+        await self.call_store_tool("cancel_checkout", {"id": session.checkout["id"]})
+        session.checkout = None
+        session.delivery_option = None
+        # The store may close the cart together with its checkout.
+        if session.cart and is_not_found(await self.call_store_tool("get_cart", {"id": session.cart["id"]})):
+            session.cart = None
+        return [text("Checkout cancelled.")], ["What's in my cart?"]
+
+    def checkout_payload(self, session: Session) -> dict:
+        """The whole checkout, as UCP update_checkout expects (it replaces the previous state)."""
+        lines = session.checkout.get("line_items") or []
+        payload: dict = {
+            "line_items": [{"item": {"id": line["item"]["id"]}, "quantity": line["quantity"]} for line in lines],
+            "context": self.cart_context,
+        }
+        if session.buyer:
+            payload["buyer"] = session.buyer
+        if session.address and not missing_recipient(session):
+            # The store needs the recipient's name and phone with the address, and keeps the
+            # first destination it was given, so the destination is sent once it is complete.
+            recipient = {k: session.buyer[k] for k in RECIPIENT_FIELDS}
+            method = {
+                "type": "shipping",
+                "line_item_ids": [line["id"] for line in lines],
+                "destinations": [{**session.address, **recipient}],
+            }
+            group = (shipping_method(session.checkout).get("groups") or [{}])[0]
+            if session.delivery_option and group.get("id"):
+                method["groups"] = [{"id": group["id"], "selected_option_id": session.delivery_option}]
+            payload["fulfillment"] = {"methods": [method]}
+        return payload
+
+    @staticmethod
+    def checkout_details(session: Session, message: str) -> str | None:
+        """Pick up email, phone, name and address from the message; returns what was saved."""
+        saved = []
+        if match := EMAIL_RE.search(message):
+            session.buyer["email"] = match[0]
+            saved.append("your email")
+        if match := PHONE_RE.search(message):
+            phone = re.sub(r"[^\d+]", "", match["phone"])
+            # UCP expects E.164 phone numbers; assume a US number when no country code is given.
+            session.buyer["phone_number"] = phone if phone.startswith("+") else f"+1{phone[-10:]}"
+            saved.append("your phone number")
+        if match := NAME_RE.search(message):
+            session.buyer["first_name"] = match["first"].strip()
+            if match["last"]:
+                session.buyer["last_name"] = match["last"].strip()
+            saved.append("your name")
+        if (match := ADDRESS_RE.match(message)) and (address := parse_address(match["address"])):
+            session.address = address
+            saved.append("the shipping address")
+        return " and ".join(saved) or None
+
+    @staticmethod
+    def find_delivery_option(session: Session, message: str) -> dict | None:
+        group = (shipping_method(session.checkout).get("groups") or [{}])[0]
+        wanted = message.strip().lower()
+        return next((o for o in group.get("options") or [] if o.get("title", "").lower() == wanted), None)
+
+    def checkout_reply(self, session: Session, response: dict, heading: str):
+        """Show the checkout, say what the store still needs, and hand off when only the store can finish."""
+        if is_not_found(response):
+            session.checkout = None
+            return [text("That checkout has expired. Choose Checkout again to start a new one.")], ["What's in my cart?"]
+        if not response.get("id"):
+            return notices(response.get("messages")) or [notice("error", "The store couldn't open a checkout.")], []
+
+        session.checkout = response
+        blocks = [text(heading), checkout_block(response)]
+
+        # UCP: fix "recoverable" errors with update_checkout; anything needing the
+        # buyer (requires_buyer_input / review, or status requires_escalation) goes to continue_url.
+        hints = {
+            "buyer_identity_contact_method_required": "your email — *my email is you@example.com*",
+            "delivery_address_required": "a shipping address — *ship to 123 Main St, Springfield, IL 62701*",
+            "delivery_first_name_required": "your name — *my name is Jane Doe*",
+            "delivery_last_name_required": "your name — *my name is Jane Doe*",
+            "delivery_phone_number_required": "a phone number — *my phone is +1 217 555 0123*",
+        }
+        recoverable = [m for m in response.get("messages") or []
+                       if m.get("type") == "error" and m.get("severity") == "recoverable"
+                       # Before any address is given the store also says it can't deliver; skip that.
+                       and not (m.get("code") == "delivery_no_delivery_available" and not session.address)]
+        if session.address and missing_recipient(session):
+            # We have the address but haven't sent it yet (see checkout_payload).
+            recoverable = [m for m in recoverable if m.get("code") != "delivery_address_required"]
+            recoverable += [{"code": f"delivery_{field}_required"} for field in missing_recipient(session)]
+        needed = list(dict.fromkeys(hints.get(m.get("code"), m.get("content", "")) for m in recoverable))
+        if needed:
+            blocks.append(text("To continue, tell me:\n\n" + "\n".join(f"- {item}" for item in needed)))
+        elif response.get("continue_url"):
+            blocks.append(text(
+                f"Everything I can fill in here is done. Payment and placing the order happen on "
+                f"{self.store_name}'s own checkout page: "
+                f"[Continue to payment on {self.store_name}]({response['continue_url']})"
+            ))
+        return blocks, ["Show my checkout", "Cancel checkout"]
+
+
+RECIPIENT_FIELDS = ("first_name", "last_name", "phone_number")
+
+
+def missing_recipient(session: Session) -> list[str]:
+    """Recipient details the delivery destination still needs."""
+    return [field for field in RECIPIENT_FIELDS if not session.buyer.get(field)]
 
 
 def is_not_found(response: dict) -> bool:

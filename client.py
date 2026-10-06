@@ -139,6 +139,9 @@ MCP_CLIENT_URL: str | None = None
 exchanges: list[dict] = []
 MAX_EXCHANGES = 200
 
+# The UCP spec requires meta.idempotency-key for these tools.
+IDEMPOTENT_TOOLS = {"cancel_cart", "complete_checkout", "cancel_checkout"}
+
 # The business profile, cached as UCP recommends (at least 60 seconds, or the
 # profile's own Cache-Control max-age if longer).
 MIN_PROFILE_TTL = 60
@@ -251,11 +254,11 @@ def log_exchange(tool: str, arguments: dict, started: float, status: int, respon
 async def call_mcp(tool: str, arguments: dict, idempotent: bool = False) -> dict:
     """
     Call one of the store's UCP MCP tools and return its JSON result.
-    `arguments` are the tool's own parameters; the `meta` block is added here.
-    Pass idempotent=True for tools whose spec requires an idempotency key (e.g. cancel_cart).
+    `arguments` are the tool's own parameters; the `meta` block is added here,
+    with an idempotency key for the tools whose spec requires one.
     """
     meta = dict(mcp_metadata["meta"])
-    if idempotent:
+    if idempotent or tool in IDEMPOTENT_TOOLS:
         meta["idempotency-key"] = str(uuid.uuid4())
     arguments = {"meta": meta, **arguments}
 
