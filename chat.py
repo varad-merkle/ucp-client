@@ -18,8 +18,7 @@ The rules are simple and deterministic (no LLM):
     "Standard"                           -> update_checkout selecting that delivery option
     "cancel checkout"                    -> cancel_checkout
 
-Orders are not placed from the chat: payment happens on the store's own checkout
-page, through the checkout's continue_url (UCP's hand-off for requires_escalation).
+Payment is not enabled: checkout stops at reviewing the details, and no order is placed.
 
 Each reply is a list of blocks (text, notice, products, product, capabilities,
 cart, checkout) in the shape the frontend expects (see ucp-frontend/src/lib/types.ts).
@@ -301,7 +300,8 @@ def checkout_block(checkout: dict) -> dict:
             "messages": [{"type": m.get("type", "info"), "code": m.get("code"), "content": m.get("content", "")}
                          for m in checkout.get("messages") or []],
             "links": checkout.get("links") or [],
-            "continue_url": checkout.get("continue_url"),
+            # Payment is switched off for now, so the store's payment page link isn't passed on.
+            # "continue_url": checkout.get("continue_url"),
         },
     }
 
@@ -458,10 +458,14 @@ class Chat:
                 return await self.update_checkout(session, f"delivery: {option.get('title')}")
 
         if COMMERCE_RE.search(message):
-            # "Pay by ...", "Place the order": payment happens on the store's own checkout page.
-            if session.checkout and session.checkout.get("continue_url"):
-                return [text(f"Payment and placing the order happen on {self.store_name}'s own checkout page: "
-                             f"[Continue to payment on {self.store_name}]({session.checkout['continue_url']})")], []
+            # "Pay by ...", "Place the order": payment is switched off for now.
+            if session.checkout:
+                return [notice("info", "Payment isn't enabled in this assistant yet. "
+                                       "Checkout stops at reviewing your details.")], ["Show my checkout"]
+            # Hand-off to the store's own payment page (UCP continue_url); uncomment to bring it back.
+            # if session.checkout and session.checkout.get("continue_url"):
+            #     return [text(f"Payment and placing the order happen on {self.store_name}'s own checkout page: "
+            #                  f"[Continue to payment on {self.store_name}]({session.checkout['continue_url']})")], []
             return [notice("info", "Add something to your cart first, then choose Checkout.")], ["What's in my cart?"]
 
         if MORE_RE.match(message):
@@ -797,8 +801,8 @@ class Chat:
         session.checkout = response
         blocks = [text(heading), checkout_block(response)]
 
-        # UCP: fix "recoverable" errors with update_checkout; anything needing the
-        # buyer (requires_buyer_input / review, or status requires_escalation) goes to continue_url.
+        # UCP: fix "recoverable" errors with update_checkout. Anything needing the buyer on the
+        # store's own page (requires_buyer_input / review) would go to continue_url, which is switched off.
         hints = {
             "buyer_identity_contact_method_required": "your email — *my email is you@example.com*",
             "delivery_address_required": "a shipping address — *ship to 123 Main St, Springfield, IL 62701*",
@@ -817,12 +821,16 @@ class Chat:
         needed = list(dict.fromkeys(hints.get(m.get("code"), m.get("content", "")) for m in recoverable))
         if needed:
             blocks.append(text("To continue, tell me:\n\n" + "\n".join(f"- {item}" for item in needed)))
-        elif response.get("continue_url"):
-            blocks.append(text(
-                f"Everything I can fill in here is done. Payment and placing the order happen on "
-                f"{self.store_name}'s own checkout page: "
-                f"[Continue to payment on {self.store_name}]({response['continue_url']})"
-            ))
+        else:
+            blocks.append(text("Your checkout details are complete. Payment isn't enabled in this assistant yet, "
+                               "so checkout stops here."))
+        # Hand-off to the store's own payment page (UCP continue_url); uncomment to bring it back.
+        # elif response.get("continue_url"):
+        #     blocks.append(text(
+        #         f"Everything I can fill in here is done. Payment and placing the order happen on "
+        #         f"{self.store_name}'s own checkout page: "
+        #         f"[Continue to payment on {self.store_name}]({response['continue_url']})"
+        #     ))
         return blocks, ["Show my checkout", "Cancel checkout"]
 
 
