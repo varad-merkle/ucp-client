@@ -39,6 +39,7 @@ for noisy in ("pyngrok", "httpx", "httpx2", "mcp"):
 PORT = 7000
 STORE_NAME = "Pier 1"
 STORE_CURRENCY = "USD"
+STORE_COUNTRY = "US"  # prices carts in USD, like the catalog
 # The business we shop from. Its MCP endpoint is read from its /.well-known/ucp on startup.
 BUSINESS_BASE_URL = "https://www.pier1.com"
 
@@ -267,7 +268,7 @@ def check_ucp_status(response: dict, action: str) -> dict:
     raise HTTPException(status_code=status, detail=detail)
 
 
-chat = Chat(call_catalog, fetch_business_profile, STORE_NAME, STORE_CURRENCY)
+chat = Chat(call_catalog, call_mcp, fetch_business_profile, STORE_NAME, STORE_CURRENCY, STORE_COUNTRY)
 
 
 @app.get("/profile.json")

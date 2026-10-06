@@ -1,4 +1,4 @@
-"""Chat for the shopping frontend, built on the UCP catalog tools.
+"""Chat for the shopping frontend, built on the UCP catalog and cart tools.
 
 The rules are simple and deterministic (no LLM):
 
@@ -8,10 +8,15 @@ The rules are simple and deterministic (no LLM):
     "show more"                          -> search_catalog with the next cursor
     "tell me about the second one"       -> get_product on the last results
     "in Sable"                           -> get_product with that option selected
-    "add the <product>"                  -> link to the store's checkout for it
+    "add 2 of the <product>"             -> create_cart, or update_cart if there is one
+    "make the <cart item> 3"             -> update_cart with the new quantity
+    "remove the <cart item>"             -> update_cart without that line
+    "what's in my cart?"                 -> get_cart
 
-Each reply is a list of blocks (text, notice, products, product, capabilities)
-in the shape the frontend expects (see ucp-frontend/src/lib/types.ts).
+Checkout is not enabled yet; the cart stops at viewing and editing.
+
+Each reply is a list of blocks (text, notice, products, product, capabilities,
+cart) in the shape the frontend expects (see ucp-frontend/src/lib/types.ts).
 """
 
 import html
@@ -28,7 +33,11 @@ EMPTY_STATE = {"cart_count": 0, "cart_subtotal": 0, "checkout_id": None, "order_
 GREETING_RE = re.compile(r"^\s*(hi|hello|hey|help|start|what can you do)\b[\s!?.]*$", re.I)
 CAPABILITIES_RE = re.compile(r"\b(capabilit\w*|what can (the |this )?(merchant|store|shop) do|discovery)\b", re.I)
 ADD_RE = re.compile(r"^\s*add (?:(?P<qty>\d+) of )?the (?P<title>.+?)(?: in (?P<label>.+?))?\s*$", re.I)
-COMMERCE_RE = re.compile(r"\b(add|cart|checkout|check out|pay|order)\b", re.I)
+SET_QTY_RE = re.compile(r"^\s*make the (?P<title>.+?) (?P<qty>\d+)\s*$", re.I)
+REMOVE_RE = re.compile(r"^\s*remove (?:the )?(?P<title>.+?)(?: from (?:my |the )?cart)?\s*$", re.I)
+EMPTY_CART_RE = re.compile(r"^\s*(empty|clear) (my |the )?cart\b", re.I)
+VIEW_CART_RE = re.compile(r"\b(what'?s in my cart|(show|view|see|open) (me )?(my |the )?cart|my cart)\b", re.I)
+COMMERCE_RE = re.compile(r"\b(checkout|check out|pay|payment|order)\b", re.I)
 MORE_RE = re.compile(r"^\s*(show |load |see )?(more|next( page)?)\s*[.!]?\s*$", re.I)
 OPTION_RE = re.compile(r"^\s*in (?P<label>.{1,40}?)\s*$", re.I)
 DETAIL_RE = re.compile(
@@ -59,6 +68,7 @@ class Session:
     last_search: dict | None = None
     next_cursor: str | None = None
     detail: dict | None = None  # last product shown in detail
+    cart: dict | None = None  # the store's last cart response
 
 
 # ------------------------------------------------------------------ blocks
@@ -185,6 +195,42 @@ def capabilities_block(store_name: str, profile: dict) -> dict:
     }
 
 
+def total_of(totals: list[dict] | None, kind: str) -> int:
+    return next((t["amount"] for t in totals or [] if t.get("type") == kind), 0)
+
+
+def cart_block(cart: dict | None) -> dict:
+    """A UCP cart as the frontend's cart card (an empty card when there is no cart)."""
+    cart = cart or {}
+    lines = [
+        {
+            "variant_id": line["item"]["id"],
+            "title": line["item"].get("title", ""),
+            "image": line["item"].get("image_url"),
+            "price": line["item"].get("price", 0),
+            "quantity": line["quantity"],
+            "line_total": total_of(line.get("totals"), "total") or line["item"].get("price", 0) * line["quantity"],
+        }
+        for line in cart.get("line_items") or []
+    ]
+    return {
+        "type": "cart",
+        "currency": cart.get("currency", "USD"),
+        "subtotal": total_of(cart.get("totals"), "subtotal"),
+        "lines": lines,
+    }
+
+
+def cart_state(cart: dict | None) -> dict:
+    """The cart summary the frontend shows in the top bar and sidebar."""
+    cart = cart or {}
+    return {
+        **EMPTY_STATE,
+        "cart_count": sum(line["quantity"] for line in cart.get("line_items") or []),
+        "cart_subtotal": total_of(cart.get("totals"), "subtotal"),
+    }
+
+
 # ----------------------------------------------------------------- parsing
 
 
@@ -245,11 +291,16 @@ def dollars(cents: int) -> str:
 
 
 class Chat:
-    def __init__(self, call_tool: CallTool, fetch_store_profile: FetchProfile, store_name: str, currency: str):
-        self.call_tool = call_tool
+    def __init__(self, call_tool: CallTool, call_cart_tool: CallTool, fetch_store_profile: FetchProfile,
+                 store_name: str, currency: str, country: str):
+        self.call_tool = call_tool  # catalog tools: (tool, catalog parameters)
+        self.call_cart_tool = call_cart_tool  # cart tools: (tool, tool arguments)
         self.fetch_store_profile = fetch_store_profile
         self.store_name = store_name
         self.currency = currency
+        # Sent with every cart so the store prices it like the catalog (it would
+        # otherwise guess the shopper's country from their IP address).
+        self.cart_context = {"address_country": country, "currency": currency}
         self.sessions: dict[str, Session] = {}
 
     def session(self, session_id: str | None) -> Session:
@@ -268,7 +319,8 @@ class Chat:
         except Exception as exc:
             blocks = [notice("error", f"The store could not be reached: {exc}")]
             suggestions = ["Try again"]
-        return {"session_id": session.id, "blocks": blocks, "suggestions": suggestions, "state": EMPTY_STATE}
+        return {"session_id": session.id, "blocks": blocks, "suggestions": suggestions,
+                "state": cart_state(session.cart)}
 
     async def route(self, message: str, session: Session) -> tuple[list[dict], list[str]]:
         if not message or GREETING_RE.match(message):
@@ -280,11 +332,23 @@ class Chat:
             return [intro, capabilities_block(self.store_name, profile)], ["Show me floor lamps", "Quilt sets"]
 
         if match := ADD_RE.match(message):
-            return self.buy_link(session, match["title"], match["label"], int(match["qty"] or 1))
+            return await self.add_to_cart(session, match["title"], match["label"], int(match["qty"] or 1))
+
+        if match := SET_QTY_RE.match(message):
+            return await self.set_quantity(session, match["title"], int(match["qty"]))
+
+        if EMPTY_CART_RE.match(message):
+            return await self.save_cart(session, [], "Your cart is now empty.")
+
+        if match := REMOVE_RE.match(message):
+            return await self.set_quantity(session, match["title"], 0)
+
+        if VIEW_CART_RE.search(message):
+            return await self.view_cart(session)
 
         if COMMERCE_RE.search(message):
-            return [notice("info", "Cart and checkout aren't built into this assistant yet. "
-                                   "You can keep browsing and asking about products.")], []
+            return [notice("info", "Checkout isn't enabled in this assistant yet. "
+                                   "You can view and edit your cart.")], ["What's in my cart?"]
 
         if MORE_RE.match(message):
             return await self.more(session)
@@ -406,29 +470,114 @@ class Chat:
                     return await self.detail(session, product["id"], selected)
         return [text(f"“{label}” isn't an option for this product.")], []
 
-    # ---------------------------------------------------------------- buy
+    # --------------------------------------------------------------- cart
 
-    def buy_link(self, session: Session, title: str, label: str | None, quantity: int):
-        product = self.find_product(session, title)
-        if not product:
+    def pick_variant(self, session: Session, title: str, label: str | None) -> tuple[dict, dict] | None:
+        """The product and variant the shopper means by "add the <title> in <label>"."""
+        # The product open in detail comes first: its first variant is the one the shopper selected.
+        if session.detail and session.detail["title"].lower() == title.strip().lower():
+            product = session.detail
+        else:
+            product = self.find_product(session, title)
+        variants = (product or {}).get("variants") or []
+        if not variants:
+            return None
+        chosen = next((v for v in variants if label and v.get("title", "").lower() == label.strip().lower()), None)
+        return product, chosen or variants[0]
+
+    @staticmethod
+    def cart_lines(session: Session) -> dict[str, int]:
+        """The current cart as {variant id: quantity}."""
+        return {line["item"]["id"]: line["quantity"] for line in (session.cart or {}).get("line_items") or []}
+
+    @staticmethod
+    def find_cart_line(session: Session, title: str) -> str | None:
+        """The variant id of the cart line the shopper means, matched on its title."""
+        lines = (session.cart or {}).get("line_items") or []
+        wanted = title.strip().lower()
+        for line in lines:
+            if line["item"].get("title", "").lower() == wanted:
+                return line["item"]["id"]
+        wanted_words = set(keywords(wanted))
+        scored = [(len(wanted_words & set(keywords(line["item"].get("title", "")))), line) for line in lines]
+        best = max(scored, key=lambda pair: pair[0], default=(0, None))
+        return best[1]["item"]["id"] if best[0] else None
+
+    async def add_to_cart(self, session: Session, title: str, label: str | None, quantity: int):
+        found = self.pick_variant(session, title, label)
+        if not found:
             return [text("Which product? Search for it first, then use “Add to cart” on its card.")], []
+        product, variant = found
+        lines = self.cart_lines(session)
+        lines[variant["id"]] = lines.get(variant["id"], 0) + quantity
+        name = f"{product['title']} ({variant['title']})" if len(product["variants"]) > 1 else product["title"]
+        return await self.save_cart(session, lines, f"Added **{name}** × {quantity} to your cart.")
 
-        variants = product.get("variants") or []
-        variant = next((v for v in variants if label and v.get("title", "").lower() == label.lower()), None)
-        variant = variant or (variants[0] if variants else {})
-        url = variant.get("checkout_url")
-        if not url:
-            return [notice("warning", "The store didn't return a checkout link for this product.")], []
+    async def set_quantity(self, session: Session, title: str, quantity: int):
+        variant_id = self.find_cart_line(session, title)
+        if not variant_id:
+            return [text(f"“{title}” isn't in your cart.")], ["What's in my cart?"]
+        lines = self.cart_lines(session)
+        if quantity > 0:
+            lines[variant_id] = quantity
+            message = "Updated the quantity in your cart."
+        else:
+            lines.pop(variant_id)
+            message = "Removed it from your cart."
+        return await self.save_cart(session, lines, message)
 
-        name = f"{product['title']} ({variant['title']})" if len(variants) > 1 else product["title"]
-        suggestions = ["Show more"] if session.next_cursor else []
+    async def save_cart(self, session: Session, lines: dict[str, int] | list, message: str):
+        """
+        Create the cart, or replace its contents. UCP update_cart is a full
+        replacement, so every line (and the context) is sent each time.
+        """
+        items = [{"item": {"id": variant_id}, "quantity": qty} for variant_id, qty in dict(lines).items()]
+        cart = {"line_items": items, "context": self.cart_context}
 
-        # Checkout link to the store is switched off for now; uncomment to bring it back.
-        # url = re.sub(r":\d+$", f":{quantity}", url)  # the store's cart permalink ends in :<quantity>
-        # return [text(
-        #     "Cart and checkout aren't built into this assistant yet, but you can buy it straight from the store:\n\n"
-        #     f"- **{name}** × {quantity} — [Check out on {self.store_name}]({url})"
-        # )], suggestions
+        response = None
+        if session.cart:
+            response = await self.call_cart_tool("update_cart", {"id": session.cart["id"], "cart": cart})
+            if is_not_found(response):  # expired or cancelled on the store's side; start a new cart
+                session.cart = response = None
+        if not session.cart:
+            if not items:
+                return [text("Your cart is empty."), cart_block(None)], ["Show me floor lamps"]
+            response = await self.call_cart_tool("create_cart", {"cart": cart})
 
-        return [notice("info", f"Cart and checkout aren't built into this assistant yet, "
-                               f"so “{name}” can't be added right now.")], suggestions
+        if response.get("ucp", {}).get("status") == "error" or not response.get("id"):
+            failed = notices(response.get("messages")) or [notice("error", "The store couldn't update the cart.")]
+            return failed, ["What's in my cart?"]
+        session.cart = response
+        suggestions = ["What's in my cart?"] + (["Show more"] if session.next_cursor else [])
+        return [text(message), cart_block(response), *notices(response.get("messages"))], suggestions
+
+    async def view_cart(self, session: Session):
+        if not session.cart:
+            return [text("Your cart is empty."), cart_block(None)], ["Show me floor lamps"]
+
+        response = await self.call_cart_tool("get_cart", {"id": session.cart["id"]})
+        if is_not_found(response):
+            session.cart = None
+            return [text("Your cart has expired, so it's empty now."), cart_block(None)], ["Show me floor lamps"]
+        if response.get("ucp", {}).get("status") == "error":
+            return notices(response.get("messages")) or [notice("error", "The store couldn't load the cart.")], []
+
+        session.cart = response
+        count = cart_state(response)["cart_count"]
+        heading = f"You have {count} item{'' if count == 1 else 's'} in your cart:" if count else "Your cart is empty."
+        blocks = [text(heading), cart_block(response),
+                  *notices(response.get("messages"))]
+
+        # Checkout hand-off to the store is switched off for now; uncomment to show it.
+        # UCP gives the cart a continue_url for finishing the purchase on the store's site.
+        # if response.get("continue_url"):
+        #     blocks.append(text(f"[Check out on {self.store_name}]({response['continue_url']})"))
+
+        return blocks, []
+
+
+def is_not_found(response: dict) -> bool:
+    """UCP reports a missing (expired or cancelled) cart as an error with a *not_found code."""
+    return response.get("ucp", {}).get("status") == "error" and any(
+        str(m.get("code", "")).endswith("not_found") for m in response.get("messages") or []
+    )
