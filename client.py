@@ -21,6 +21,10 @@ from ucp_sdk.models.schemas.shopping.cart_create_request import CartCreateReques
 from ucp_sdk.models.schemas.shopping.cart_update_request import CartUpdateRequest
 from ucp_sdk.models.schemas.shopping.catalog_lookup import GetProductRequest, LookupRequest
 from ucp_sdk.models.schemas.shopping.catalog_search import SearchRequest
+from ucp_sdk.models.schemas.shopping.checkout_complete_request import CheckoutCompleteRequest
+from ucp_sdk.models.schemas.shopping.checkout_create_request import CheckoutCreateRequest
+from ucp_sdk.models.schemas.shopping.checkout_update_request import CheckoutUpdateRequest
+from ucp_sdk.models.schemas.shopping.types.line_item_create_request import LineItemCreateRequest
 
 import config
 from chat import Chat
@@ -54,6 +58,31 @@ class MCPUpdateCartRequest(BaseModel):
 
 
 class CancelCartRequest(BaseModel):
+    id: str
+
+
+# Checkout request models
+class CheckoutCreateMCPRequest(CheckoutCreateRequest):
+    # UCP lets a checkout start from an existing cart (cart_id) instead of line items.
+    line_items: list[LineItemCreateRequest] | None = None
+    cart_id: str | None = None
+
+
+class GetCheckoutRequest(BaseModel):
+    id: str
+
+
+class MCPUpdateCheckoutRequest(BaseModel):
+    id: str
+    checkout: CheckoutUpdateRequest
+
+
+class MCPCompleteCheckoutRequest(BaseModel):
+    id: str
+    checkout: CheckoutCompleteRequest
+
+
+class CancelCheckoutRequest(BaseModel):
     id: str
 
 
@@ -93,6 +122,11 @@ TOOL_CAPABILITIES = {
     "get_cart": "dev.ucp.shopping.cart",
     "update_cart": "dev.ucp.shopping.cart",
     "cancel_cart": "dev.ucp.shopping.cart",
+    "create_checkout": "dev.ucp.shopping.checkout",
+    "get_checkout": "dev.ucp.shopping.checkout",
+    "update_checkout": "dev.ucp.shopping.checkout",
+    "complete_checkout": "dev.ucp.shopping.checkout",
+    "cancel_checkout": "dev.ucp.shopping.checkout",
 }
 
 # Set on startup: our public URL (ngrok), the `meta` block that carries our
@@ -186,7 +220,9 @@ def summarize(response: dict) -> str:
     if response.get("product"):
         parts.append(f"product '{response['product'].get('title')}'")
     if "line_items" in response:
-        parts.append(f"cart {response.get('id')} with {len(response['line_items'] or [])} line items")
+        # Checkouts carry a status (incomplete, ready_for_complete, ...); carts don't.
+        kind = f"checkout ({response['status']})" if response.get("status") else "cart"
+        parts.append(f"{kind} {response.get('id')} with {len(response['line_items'] or [])} line items")
     if (response.get("pagination") or {}).get("has_next_page"):
         parts.append("more pages available")
     for message in response.get("messages") or []:
@@ -411,6 +447,69 @@ async def cancel_cart_mcp(request: CancelCartRequest):
     """
     response = check_ucp_status(await call_mcp("cancel_cart", {"id": request.id}, idempotent=True), "Cart cancellation")
     logger.info(f"Cart cancelled: {request.id}")
+    return response
+
+
+@app.post("/api/mcp/checkout/create")
+async def create_checkout_mcp(request: CheckoutCreateMCPRequest):
+    """
+    Create a checkout via an MCP client.
+    Accepts either a cart_id (cart-to-checkout conversion) or line_items directly.
+    """
+    checkout = request.model_dump(mode="json", exclude_none=True)
+    if not checkout.get("cart_id") and not checkout.get("line_items"):
+        raise HTTPException(status_code=400, detail="Provide either cart_id or line_items")
+    if checkout.get("cart_id"):
+        # The store takes the items from the cart; line_items is still a required field.
+        checkout.setdefault("line_items", [])
+    return check_ucp_status(await call_mcp("create_checkout", {"checkout": checkout}), "Checkout creation")
+
+
+@app.post("/api/mcp/checkout/get")
+async def get_checkout_mcp(request: GetCheckoutRequest):
+    """
+    Fetch an existing checkout via an MCP client.
+    Expects a valid Checkout ID.
+    """
+    return check_ucp_status(await call_mcp("get_checkout", {"id": request.id}), "Checkout fetch")
+
+
+@app.post("/api/mcp/checkout/update")
+async def update_checkout_mcp(request: MCPUpdateCheckoutRequest):
+    """
+    Update an existing checkout via an MCP client.
+    Note: The checkout payload is a full replacement of the session state.
+    """
+    checkout = request.checkout.model_dump(mode="json", exclude_none=True)
+    return check_ucp_status(
+        await call_mcp("update_checkout", {"id": request.id, "checkout": checkout}), "Checkout update"
+    )
+
+
+@app.post("/api/mcp/checkout/complete")
+async def complete_checkout_mcp(request: MCPCompleteCheckoutRequest):
+    """
+    Complete a checkout (place the order) via an MCP client.
+    Expects a valid Checkout ID and payment details.
+    The UCP spec requires an idempotency key for complete_checkout.
+    """
+    checkout = request.checkout.model_dump(mode="json", exclude_none=True)
+    return check_ucp_status(
+        await call_mcp("complete_checkout", {"id": request.id, "checkout": checkout}, idempotent=True),
+        "Checkout completion",
+    )
+
+
+@app.post("/api/mcp/checkout/cancel")
+async def cancel_checkout_mcp(request: CancelCheckoutRequest):
+    """
+    Cancel an existing checkout via an MCP client.
+    The UCP spec requires an idempotency key for cancel_checkout.
+    """
+    response = check_ucp_status(
+        await call_mcp("cancel_checkout", {"id": request.id}, idempotent=True), "Checkout cancellation"
+    )
+    logger.info(f"Checkout cancelled: {request.id}")
     return response
 
 
