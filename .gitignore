@@ -1,2 +1,21 @@
-__pycache__/
+# Virtual environments
 .venv/
+venv/
+
+# Local environment variables
+.env
+.env.*
+!.env.example
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

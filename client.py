@@ -1,20 +1,24 @@
+import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from load_dotenv import load_dotenv
 from mcp import Client
 from mcp_types import TextContent
 from pydantic import BaseModel
 from pyngrok import ngrok
 from pyngrok.exception import PyngrokNgrokHTTPError
+from ucp_sdk.models.schemas.shopping.cart_create_request import CartCreateRequest
+from ucp_sdk.models.schemas.shopping.cart_update_request import CartUpdateRequest
 from ucp_sdk.models.schemas.shopping.catalog_lookup import GetProductRequest, LookupRequest
 from ucp_sdk.models.schemas.shopping.catalog_search import SearchRequest
 
@@ -34,9 +38,23 @@ for noisy in ("pyngrok", "httpx", "httpx2", "mcp"):
 
 PORT = 7000
 STORE_NAME = "Pier 1"
-STORE_URL = "https://p1-dev.myshopify.com"
 STORE_CURRENCY = "USD"
-MCP_CLIENT_URL = f"{STORE_URL}/api/ucp/mcp"
+# The business we shop from. Its MCP endpoint is read from its /.well-known/ucp on startup.
+BUSINESS_BASE_URL = "https://www.pier1.com"
+
+
+class GetCartRequest(BaseModel):
+    id: str
+
+
+class MCPUpdateCartRequest(BaseModel):
+    id: str
+    cart: CartUpdateRequest
+
+
+class CancelCartRequest(BaseModel):
+    id: str
+
 
 # Merchant configuration (running on different ports)
 MERCHANTS_CONFIG = [
@@ -70,33 +88,71 @@ TOOL_CAPABILITIES = {
     "search_catalog": "dev.ucp.shopping.catalog.search",
     "lookup_catalog": "dev.ucp.shopping.catalog.lookup",
     "get_product": "dev.ucp.shopping.catalog.lookup",
+    "create_cart": "dev.ucp.shopping.cart",
+    "get_cart": "dev.ucp.shopping.cart",
+    "update_cart": "dev.ucp.shopping.cart",
+    "cancel_cart": "dev.ucp.shopping.cart",
 }
 
-# The store fetches our profile from this public URL before answering any call.
-# It is set when the ngrok tunnel opens on startup.
-profile_url = ""
+# Set on startup: our public URL (ngrok), the `meta` block that carries our
+# profile URL, and the business's MCP endpoint.
+public_url: str | None = None
+mcp_metadata: dict = {}
+MCP_CLIENT_URL: str | None = None
 
 # Recent calls to the store, newest first, for the frontend's protocol log.
 exchanges: list[dict] = []
 MAX_EXCHANGES = 200
 
+# The business profile, cached as UCP recommends (at least 60 seconds, or the
+# profile's own Cache-Control max-age if longer).
+MIN_PROFILE_TTL = 60
+profile_cache: dict = {"profile": None, "expires": 0.0}
+
+
+async def fetch_business_profile(base_url: str = BUSINESS_BASE_URL) -> dict:
+    if profile_cache["profile"] and time.monotonic() < profile_cache["expires"]:
+        return profile_cache["profile"]
+
+    url = f"{base_url.rstrip('/')}/.well-known/ucp"
+    # UCP: platforms must not follow redirects when fetching a business profile.
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as http:
+        resp = await http.get(url, headers={"Accept": "application/json"})
+        resp.raise_for_status()
+        profile = resp.json()
+
+    max_age = re.search(r"max-age=(\d+)", resp.headers.get("cache-control", ""))
+    ttl = max(MIN_PROFILE_TTL, int(max_age[1]) if max_age else 0)
+    profile_cache.update(profile=profile, expires=time.monotonic() + ttl)
+    return profile
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global profile_url
+    global public_url, mcp_metadata, MCP_CLIENT_URL
+
+    # 1. Start the tunnel, so the store can fetch our profile.
     try:
-        tunnel = ngrok.connect(addr=str(PORT))
+        ngrok_tunnel = ngrok.connect(addr=str(PORT))
     except PyngrokNgrokHTTPError as exc:
         # Free ngrok accounts allow one tunnel, so a second client.py can't start.
         raise RuntimeError(
             "Could not open the ngrok tunnel. Is client.py already running in another terminal?"
         ) from exc
-    profile_url = f"{tunnel.public_url}/profile.json"
-    logger.info(f"Public profile URL: {profile_url}")
-    logger.info(f"Store: {STORE_NAME} ({MCP_CLIENT_URL})")
+    public_url = ngrok_tunnel.public_url
+    logger.info(f"Public profile URL: {public_url}/profile.json")
+
+    # 2. Build our own platform metadata.
+    mcp_metadata = config.get_mcp_metadata(dynamic_url=public_url)
+
+    # 3. Fetch the business's profile and find its MCP endpoint.
+    profile = await fetch_business_profile()
+    MCP_CLIENT_URL = config.extract_mcp_endpoint(profile)
+    logger.info(f"Store: {STORE_NAME}, discovered MCP endpoint: {MCP_CLIENT_URL}")
     logger.info(f"Ready on http://localhost:{PORT} - start the frontend and open http://localhost:5173")
+
     yield
-    ngrok.disconnect(tunnel.public_url)
+    ngrok.disconnect(ngrok_tunnel.public_url)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -128,6 +184,8 @@ def summarize(response: dict) -> str:
         parts.append(f"{len(response['products'] or [])} products")
     if response.get("product"):
         parts.append(f"product '{response['product'].get('title')}'")
+    if "line_items" in response:
+        parts.append(f"cart {response.get('id')} with {len(response['line_items'] or [])} line items")
     if (response.get("pagination") or {}).get("has_next_page"):
         parts.append("more pages available")
     for message in response.get("messages") or []:
@@ -143,9 +201,9 @@ def log_exchange(tool: str, arguments: dict, started: float, status: int, respon
         "url": MCP_CLIENT_URL,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
-        "ok": error is None,
+        "ok": error is None and (response or {}).get("ucp", {}).get("status") != "error",
         "duration_ms": round((time.perf_counter() - started) * 1000),
-        "request_headers": {"UCP-Agent": f'profile="{profile_url}"'},
+        "request_headers": {"UCP-Agent": f'profile="{public_url}/profile.json"'},
         "request_body": arguments,
         "response_body": response,
         "error": error,
@@ -153,16 +211,32 @@ def log_exchange(tool: str, arguments: dict, started: float, status: int, respon
     del exchanges[MAX_EXCHANGES:]
 
 
-async def call_mcp(tool: str, catalog: dict) -> dict:
-    """Call one of the store's UCP MCP tools and return its JSON result."""
-    arguments = {"meta": {"ucp-agent": {"profile": profile_url}}, "catalog": catalog}
-    logger.info(f"  -> {tool} {json.dumps(catalog)}")
+async def call_mcp(tool: str, arguments: dict, idempotent: bool = False) -> dict:
+    """
+    Call one of the store's UCP MCP tools and return its JSON result.
+    `arguments` are the tool's own parameters; the `meta` block is added here.
+    Pass idempotent=True for tools whose spec requires an idempotency key (e.g. cancel_cart).
+    """
+    meta = dict(mcp_metadata["meta"])
+    if idempotent:
+        meta["idempotency-key"] = str(uuid.uuid4())
+    arguments = {"meta": meta, **arguments}
+
+    logger.info(f"  -> {tool} {json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
     started = time.perf_counter()
     try:
         async with Client(MCP_CLIENT_URL) as mcp_client:
             result = await mcp_client.call_tool(tool, arguments)
-        text = next(block.text for block in result.content if isinstance(block, TextContent))
-        response = json.loads(text)
+        text = next((block.text for block in result.content if isinstance(block, TextContent)), "")
+        # UCP returns its response in structuredContent; the text block is the same data as JSON.
+        try:
+            response = result.structured_content or json.loads(text)
+        except json.JSONDecodeError:
+            response = None
+        # Business outcomes (e.g. cart not found) still come back as a UCP response,
+        # even when the tool call is flagged as an error. Anything else is a real failure.
+        if not isinstance(response, dict) or (result.is_error and "ucp" not in response):
+            raise RuntimeError(text or "the store returned a tool error")
     except Exception as exc:
         message = error_message(exc)
         logger.error(f"  <- {tool} failed: {message}")
@@ -170,32 +244,46 @@ async def call_mcp(tool: str, catalog: dict) -> dict:
         raise HTTPException(status_code=502, detail=f"{tool} failed: {message}")
     log_exchange(tool, arguments, started, 200, response)
     elapsed = round((time.perf_counter() - started) * 1000)
-    logger.info(f"  <- {tool} OK in {elapsed} ms: {summarize(response)}")
+    outcome = "returned an error" if response.get("ucp", {}).get("status") == "error" else "OK"
+    logger.info(f"  <- {tool} {outcome} in {elapsed} ms: {summarize(response)}")
     return response
 
 
-async def fetch_store_profile() -> dict:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{STORE_URL}/.well-known/ucp")
-        response.raise_for_status()
-        return response.json()
+async def call_catalog(tool: str, catalog: dict) -> dict:
+    """Catalog tools take their parameters under `catalog`."""
+    return await call_mcp(tool, {"catalog": catalog})
 
 
-chat = Chat(call_mcp, fetch_store_profile, STORE_NAME, STORE_CURRENCY)
+def check_ucp_status(response: dict, action: str) -> dict:
+    """
+    UCP reports business outcomes (e.g. cart not found) as a normal result with
+    ucp.status "error" and the reason in `messages`. Turn those into HTTP errors.
+    """
+    if response.get("ucp", {}).get("status") != "error":
+        return response
+    msgs = response.get("messages") or []
+    detail = "; ".join(m.get("content", "") for m in msgs) or f"{action} failed"
+    status = 404 if any(str(m.get("code", "")).endswith("not_found") for m in msgs) else 422
+    raise HTTPException(status_code=status, detail=detail)
+
+
+chat = Chat(call_catalog, fetch_business_profile, STORE_NAME, STORE_CURRENCY)
 
 
 @app.get("/profile.json")
-async def get_agent_profile_json():
-    # The store only accepts a profile served with a Cache-Control header.
-    return JSONResponse(read_profile(), headers={"Cache-Control": "public, max-age=3600"})
-
-
 @app.get("/profile")
 async def get_agent_profile(request: Request):
-    """Return this agent's UCP profile."""
-    logger.info(f"Profile fetched by: {request.client.host}")
-    logger.info(f"User-Agent: {request.headers.get('user-agent')}")
-    return read_profile()
+    """
+    Return this agent's UCP profile. UCP requires Cache-Control with `public` and a
+    max-age of at least 60 seconds, and recommends a validator such as ETag.
+    """
+    logger.info(f"Profile fetched by: {request.client.host} ({request.headers.get('user-agent')})")
+    profile = read_profile()
+    etag = '"' + hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()[:32] + '"'
+    headers = {"Cache-Control": "public, max-age=3600", "ETag": etag}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(profile, headers=headers)
 
 
 # API Endpoints for Frontend
@@ -246,7 +334,7 @@ async def search_products(search_req: SearchRequest, merchant_id: str | None = N
 @app.post("/api/mcp/catalog/search/")
 async def search_products_mcp(query: SearchRequest):
     """ Search products via an MCP client """
-    response = await call_mcp("search_catalog", {"query": query.query})
+    response = await call_catalog("search_catalog", {"query": query.query})
     return response.get("products")
 
 
@@ -262,7 +350,7 @@ async def lookup_products_mcp(request: LookupRequest):
     """
     # Extract unique product IDs for lookup
     unique_product_ids = sorted(set(request.ids))
-    response = await call_mcp("lookup_catalog", {"ids": unique_product_ids})
+    response = await call_catalog("lookup_catalog", {"ids": unique_product_ids})
     products = response.get("products") or []
     messages = response.get("messages") or []
     if not products:
@@ -278,11 +366,51 @@ async def lookup_products_mcp(request: LookupRequest):
 
 @app.post("/api/mcp/catalog/product")
 async def get_product_detail(request: GetProductRequest):
-    response = await call_mcp("get_product", {"id": request.id})
+    response = await call_catalog("get_product", {"id": request.id})
     if response.get("product"):
         return response["product"]
     logger.info("No products found. Ensure entered IDs are valid.")
     return response.get("messages") or []
+
+
+@app.post("/api/mcp/cart/create")
+async def create_cart_mcp(request: CartCreateRequest):
+    """
+    Create a new cart via an MCP client.
+    Expects a list of Variant IDs and quantities.
+    """
+    cart = request.model_dump(mode="json", exclude_none=True)
+    return check_ucp_status(await call_mcp("create_cart", {"cart": cart}), "Cart creation")
+
+
+@app.post("/api/mcp/cart/get")
+async def get_cart_mcp(request: GetCartRequest):
+    """
+    Fetch an existing cart via an MCP client.
+    Expects a valid Cart ID.
+    """
+    return check_ucp_status(await call_mcp("get_cart", {"id": request.id}), "Cart fetch")
+
+
+@app.post("/api/mcp/cart/update")
+async def update_cart_mcp(request: MCPUpdateCartRequest):
+    """
+    Update an existing cart via an MCP client.
+    UCP: the platform must send the entire cart; line_items fully replaces the cart's contents.
+    """
+    cart = request.cart.model_dump(mode="json", exclude_none=True)
+    return check_ucp_status(await call_mcp("update_cart", {"id": request.id, "cart": cart}), "Cart update")
+
+
+@app.post("/api/mcp/cart/cancel")
+async def cancel_cart_mcp(request: CancelCartRequest):
+    """
+    Cancel an existing cart via an MCP client.
+    The UCP spec requires an idempotency key for cancel_cart.
+    """
+    response = check_ucp_status(await call_mcp("cancel_cart", {"id": request.id}, idempotent=True), "Cart cancellation")
+    logger.info(f"Cart cancelled: {request.id}")
+    return response
 
 
 # Endpoints for the chat frontend (ucp-frontend)
@@ -306,8 +434,8 @@ async def health():
     store = {"reachable": False, "status": 0, "latency_ms": 0, "name": STORE_NAME}
     started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{STORE_URL}/.well-known/ucp")
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            response = await client.get(f"{BUSINESS_BASE_URL}/.well-known/ucp")
         store["status"] = response.status_code
         store["reachable"] = response.status_code == 200
     except httpx.HTTPError:
@@ -317,8 +445,8 @@ async def health():
         "agent": {
             "status": "ok",
             "version": read_profile()["ucp"]["version"],
-            "profile_url": profile_url,
-            "merchant_url": STORE_URL,
+            "profile_url": f"{public_url}/profile.json",
+            "merchant_url": BUSINESS_BASE_URL,
         },
         "merchant": store,
     }
@@ -340,7 +468,8 @@ def get_headers() -> dict[str, str]:
     headers = {
         "idempotency-key": str(uuid.uuid4()),
         "request-id": str(uuid.uuid4()),
-        "UCP-Agent": f'profile="{profile_url}"; version={config.get_version()}'
+        # UCP-Agent is an RFC 8941 dictionary; the store reads our version from the profile itself.
+        "UCP-Agent": f'profile="{public_url}/profile.json"'
     }
     return headers
 
