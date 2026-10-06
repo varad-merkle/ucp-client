@@ -21,7 +21,7 @@ from ucp_sdk.models.schemas.shopping.cart_create_request import CartCreateReques
 from ucp_sdk.models.schemas.shopping.cart_update_request import CartUpdateRequest
 from ucp_sdk.models.schemas.shopping.catalog_lookup import GetProductRequest, LookupRequest
 from ucp_sdk.models.schemas.shopping.catalog_search import SearchRequest
-from ucp_sdk.models.schemas.shopping.checkout_complete_request import CheckoutCompleteRequest
+# from ucp_sdk.models.schemas.shopping.checkout_complete_request import CheckoutCompleteRequest  # payment, switched off
 from ucp_sdk.models.schemas.shopping.checkout_create_request import CheckoutCreateRequest
 from ucp_sdk.models.schemas.shopping.checkout_update_request import CheckoutUpdateRequest
 from ucp_sdk.models.schemas.shopping.types.line_item_create_request import LineItemCreateRequest
@@ -77,9 +77,10 @@ class MCPUpdateCheckoutRequest(BaseModel):
     checkout: CheckoutUpdateRequest
 
 
-class MCPCompleteCheckoutRequest(BaseModel):
-    id: str
-    checkout: CheckoutCompleteRequest
+# Used by the complete (payment) endpoint, which is switched off for now.
+# class MCPCompleteCheckoutRequest(BaseModel):
+#     id: str
+#     checkout: CheckoutCompleteRequest
 
 
 class CancelCheckoutRequest(BaseModel):
@@ -489,18 +490,20 @@ async def update_checkout_mcp(request: MCPUpdateCheckoutRequest):
     )
 
 
-@app.post("/api/mcp/checkout/complete")
-async def complete_checkout_mcp(request: MCPCompleteCheckoutRequest):
-    """
-    Complete a checkout (place the order) via an MCP client.
-    Expects a valid Checkout ID and payment details.
-    The UCP spec requires an idempotency key for complete_checkout.
-    """
-    checkout = request.checkout.model_dump(mode="json", exclude_none=True)
-    return check_ucp_status(
-        await call_mcp("complete_checkout", {"id": request.id, "checkout": checkout}, idempotent=True),
-        "Checkout completion",
-    )
+# Payment is switched off for now; uncomment to bring back placing the order
+# (also uncomment MCPCompleteCheckoutRequest and the CheckoutCompleteRequest import).
+# @app.post("/api/mcp/checkout/complete")
+# async def complete_checkout_mcp(request: MCPCompleteCheckoutRequest):
+#     """
+#     Complete a checkout (place the order) via an MCP client.
+#     Expects a valid Checkout ID and payment details.
+#     The UCP spec requires an idempotency key for complete_checkout.
+#     """
+#     checkout = request.checkout.model_dump(mode="json", exclude_none=True)
+#     return check_ucp_status(
+#         await call_mcp("complete_checkout", {"id": request.id, "checkout": checkout}, idempotent=True),
+#         "Checkout completion",
+#     )
 
 
 @app.post("/api/mcp/checkout/cancel")
