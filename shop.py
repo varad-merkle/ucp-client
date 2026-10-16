@@ -1,19 +1,32 @@
 """The shopping session and the UCP actions behind the chat.
 
-agent.py's model decides what to do; the methods here do it. Each action calls the
+agent.py's model decides what to do; the methods here do it. Each action calls a
 store's UCP tools and returns blocks for the frontend (text, notice, products,
 product, capabilities, cart, checkout - see ucp-frontend/src/lib/types.ts).
+
+Several stores: a search goes to the stores selling the categories the model picked,
+every product is tagged with its store, and each store has its own cart. UCP carts
+and checkouts belong to one business, so there is one checkout per store, and one
+open at a time.
 
 Payment is not enabled: checkout stops at reviewing the details.
 """
 
+import asyncio
 import html
+import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-PAGE_SIZE = 8
+from merchants import CART, CHECKOUT, SEARCH, Merchant, Registry
+
+logger = logging.getLogger("ucp-client")
+
+PAGE_SIZE = 8  # products per page from a single store
+MIN_PER_STORE = 4  # products per page from each store when several are searched
+MAX_CATEGORIES = 3
 MAX_SESSIONS = 500
 EMPTY_STATE = {"cart_count": 0, "cart_subtotal": 0, "checkout_id": None}
 
@@ -29,20 +42,23 @@ HIDDEN_CAPABILITIES = {
     "dev.ucp.common.identity_linking",
 }
 
-CallTool = Callable[[str, dict], Awaitable[dict]]
-FetchProfile = Callable[[], Awaitable[dict]]
+# Products returned by a store are tagged with its merchant id under this key.
+STORE_KEY = "_merchant"
+
+CallTool = Callable[[Merchant, str, dict], Awaitable[dict]]
 Blocks = list[dict]
 
 
 @dataclass
 class Session:
     id: str
-    products: list[dict] = field(default_factory=list)  # last products shown, in display order
-    last_search: dict | None = None
-    next_cursor: str | None = None
+    products: list[dict] = field(default_factory=list)  # last products shown, in display order, tagged with STORE_KEY
+    last_search: dict | None = None  # the request, without pagination
+    next_cursors: dict[str, str] = field(default_factory=dict)  # merchant id -> next page cursor
     detail: dict | None = None  # last product shown in detail
-    cart: dict | None = None  # the store's last cart response
-    checkout: dict | None = None  # the store's last checkout response
+    carts: dict[str, dict] = field(default_factory=dict)  # merchant id -> that store's last cart response
+    checkout: dict | None = None  # the open checkout's last response
+    checkout_store: str | None = None  # merchant id of the open checkout
     # Checkout details the shopper gave. UCP update_checkout is a full replacement,
     # so these are sent again with every update.
     buyer: dict = field(default_factory=dict)
@@ -87,7 +103,14 @@ def dollars(cents: int) -> str:
     return f"${cents / 100:,.2f}"
 
 
-def product_card(product: dict) -> dict:
+def money(price: dict) -> str:
+    """A UCP price ({amount, currency}) for the model to read; not every store prices in USD."""
+    if price.get("currency", "USD") == "USD":
+        return dollars(price["amount"])
+    return f"{price['amount'] / 100:,.2f} {price['currency']}"
+
+
+def product_card(product: dict, store: str | None = None) -> dict:
     variants = product.get("variants") or []
     featured = variants[0]
     many = len(variants) > 1
@@ -95,6 +118,7 @@ def product_card(product: dict) -> dict:
     card = {
         "id": product["id"],
         "title": product["title"],
+        "brand": store,  # the frontend shows it above the title
         "image": image_of(product) or image_of(featured),
         "price": featured["price"],
         "availability": "in_stock" if featured.get("availability", {}).get("available", True) else "out_of_stock",
@@ -119,8 +143,8 @@ def product_card(product: dict) -> dict:
     return card
 
 
-def product_detail(product: dict) -> dict:
-    detail = product_card(product)
+def product_detail(product: dict, store: str | None = None) -> dict:
+    detail = product_card(product, store)
     featured = product["variants"][0]
     available = featured.get("availability", {}).get("available", True)
     description = plain_text(product.get("description"))
@@ -153,12 +177,12 @@ def product_detail(product: dict) -> dict:
     return {"type": "product", "product": detail}
 
 
-def capabilities_block(store_name: str, profile: dict) -> dict:
+def capabilities_block(merchant: Merchant, profile: dict) -> dict:
     ucp = profile.get("ucp") or {}
     return {
         "type": "capabilities",
         "version": ucp.get("version"),
-        "business": {"name": store_name},
+        "business": {"name": merchant.name, "categories": merchant.categories},
         "capabilities": [
             {"name": name, "version": entries[0].get("version"), "spec": entries[0].get("spec")}
             for name, entries in sorted((ucp.get("capabilities") or {}).items())
@@ -187,25 +211,29 @@ def line_view(line: dict) -> dict:
     }
 
 
-def cart_block(cart: dict | None) -> dict:
+def cart_block(cart: dict | None, store: str | None = None) -> dict:
     """A UCP cart as the frontend's cart card (an empty card when there is no cart)."""
     cart = cart or {}
     return {
         "type": "cart",
+        "store": store,
         "currency": cart.get("currency", "USD"),
         "subtotal": total_of(cart.get("totals"), "subtotal"),
         "lines": [line_view(line) for line in cart.get("line_items") or []],
     }
 
 
-def cart_state(cart: dict | None, checkout: dict | None = None) -> dict:
-    """The cart summary the frontend shows in the top bar and sidebar."""
-    cart = cart or {}
+def cart_count(cart: dict | None) -> int:
+    return sum(line["quantity"] for line in (cart or {}).get("line_items") or [])
+
+
+def cart_state(session: "Session") -> dict:
+    """The cart summary the frontend shows in the top bar and sidebar, across all stores' carts."""
     return {
         **EMPTY_STATE,
-        "cart_count": sum(line["quantity"] for line in cart.get("line_items") or []),
-        "cart_subtotal": total_of(cart.get("totals"), "subtotal"),
-        "checkout_id": (checkout or {}).get("id"),
+        "cart_count": sum(cart_count(cart) for cart in session.carts.values()),
+        "cart_subtotal": sum(total_of(cart.get("totals"), "subtotal") for cart in session.carts.values()),
+        "checkout_id": (session.checkout or {}).get("id"),
     }
 
 
@@ -217,7 +245,7 @@ def delivery_group(checkout: dict) -> dict:
     return (shipping_method(checkout).get("groups") or [{}])[0]
 
 
-def checkout_block(checkout: dict, given: dict | None = None) -> dict:
+def checkout_block(checkout: dict, given: dict | None = None, store: str | None = None) -> dict:
     """
     A UCP checkout as the frontend's checkout card. `given` holds the buyer and address
     details the shopper entered, to pre-fill the card's delivery details form.
@@ -230,6 +258,7 @@ def checkout_block(checkout: dict, given: dict | None = None) -> dict:
     return {
         "type": "checkout",
         "checkout": {
+            "store": store,
             "id": checkout["id"],
             "status": checkout.get("status", ""),
             "currency": checkout.get("currency", "USD"),
@@ -286,12 +315,20 @@ def singular(word: str) -> str:
     return word
 
 
-def within_price(products: list[dict], price: dict | None) -> list[dict]:
-    """The store's price filter is loose, so check each product's lowest price again."""
+def within_price(products: list[dict], price: dict | None, currency: str) -> list[dict]:
+    """
+    The store's price filter is loose, so check each product's lowest price again.
+    Prices in another currency can't be compared, so those products are kept.
+    """
     if not price:
         return products
     low, high = price.get("min", 0), price.get("max", float("inf"))
-    return [p for p in products if low <= ((p.get("price_range") or {}).get("min") or {}).get("amount", 0) <= high]
+    kept = []
+    for p in products:
+        lowest = (p.get("price_range") or {}).get("min") or {}
+        if lowest.get("currency", currency) != currency or low <= lowest.get("amount", 0) <= high:
+            kept.append(p)
+    return kept
 
 
 def is_error(response: dict) -> bool:
@@ -312,12 +349,9 @@ def missing_recipient(session: Session) -> list[str]:
 
 
 class Shop:
-    def __init__(self, call_tool: CallTool, call_store_tool: CallTool, fetch_store_profile: FetchProfile,
-                 store_name: str, currency: str, country: str):
-        self.call_tool = call_tool  # catalog tools: (tool, catalog parameters)
-        self.call_store_tool = call_store_tool  # cart and checkout tools: (tool, tool arguments)
-        self.fetch_store_profile = fetch_store_profile
-        self.store_name = store_name
+    def __init__(self, registry: Registry, call_tool: CallTool, currency: str | None = None, country: str | None = None):
+        self.registry = registry
+        self.call_tool = call_tool  # (merchant, tool, tool arguments)
         self.currency = currency
         # Sent with every cart so the store prices it like the catalog (it would
         # otherwise guess the shopper's country from their IP address).
@@ -333,61 +367,120 @@ class Shop:
         self.sessions[session.id] = session
         return session
 
-    async def capabilities(self) -> Blocks:
-        return [capabilities_block(self.store_name, await self.fetch_store_profile())]
+    def store_of(self, product: dict) -> Merchant:
+        return self.registry.get(product[STORE_KEY])
+
+    async def capabilities(self, store_id: str | None) -> Blocks:
+        merchants = [self.registry.get(store_id)] if self.registry.get(store_id) else self.registry.all()
+        blocks: Blocks = []
+        for merchant in merchants:
+            if merchant.error:
+                blocks.append(notice("warning", f"{merchant.name} is unavailable: {merchant.error}"))
+            else:
+                blocks.append(capabilities_block(merchant, await merchant.profile()))
+        return blocks
 
     # ------------------------------------------------------------- catalog
 
-    async def search(self, session: Session, query: str | None, low: int | None, high: int | None) -> Blocks:
-        request: dict = {"pagination": {"limit": PAGE_SIZE}, "context": {"currency": self.currency}}
+    def stores_for(self, categories: list[str] | None) -> tuple[list[Merchant], str]:
+        """The stores to search for these categories, and a note saying why, for the model."""
+        searchable = [m for m in self.registry.all() if m.supports(SEARCH)]
+        wanted = [c for c in categories or [] if c in self.registry.categories][:MAX_CATEGORIES]
+        if not wanted:
+            return searchable, "No category was given, so every store was searched."
+        selling = self.registry.selling(wanted)
+        chosen = [m for m in selling if m.supports(SEARCH)]
+        down = [m.name for m in selling if not m.supports(SEARCH)]
+        note = f" ({', '.join(down)} also sells this but can't be searched right now.)" if down else ""
+        if not chosen:
+            return searchable, f"No available store sells {', '.join(wanted)}, so every store was searched.{note}"
+        return chosen, f"Searched {', '.join(m.name for m in chosen)} for {', '.join(wanted)}.{note}"
+
+    async def search(self, session: Session, query: str | None, categories: list[str] | None,
+                     low: int | None, high: int | None) -> Blocks:
+        stores, why = self.stores_for(categories)
+        logger.info(f"Categories {categories} -> {[m.id for m in stores]}: {why}")
+        request: dict = {"context": {"currency": self.currency}}
         if query:
             request["query"] = query
         if low is not None or high is not None:
             request["filters"] = {"price": {k: v for k, v in (("min", low), ("max", high)) if v is not None}}
+        session.last_search = request
+        session.next_cursors = {}
+        limit = PAGE_SIZE if len(stores) == 1 else MIN_PER_STORE
+        results = await asyncio.gather(*(self.search_store(m, request, limit) for m in stores), return_exceptions=True)
+        return self.show_results(session, request, list(zip(stores, results)), why)
 
-        response = await self.call_tool("search_catalog", request)
+    async def search_store(self, merchant: Merchant, request: dict, limit: int, cursor: str | None = None) -> dict:
+        page = {"limit": limit, **({"cursor": cursor} if cursor else {})}
+        response = await self.call_tool(merchant, "search_catalog", {"catalog": {**request, "pagination": page}})
+        query = request.get("query")
         # Nothing found for "lamps"? Try "lamp".
-        if not response.get("products") and query and (simpler := " ".join(map(singular, query.split()))) != query:
-            request = {**request, "query": simpler}
-            response = await self.call_tool("search_catalog", request)
-        return self.show_results(session, request, response)
+        if not cursor and not response.get("products") and query and (simpler := " ".join(map(singular, query.split()))) != query:
+            response = await self.call_tool(merchant, "search_catalog",
+                                            {"catalog": {**request, "query": simpler, "pagination": page}})
+        return response
 
     async def more(self, session: Session) -> Blocks:
-        if not session.last_search or not session.next_cursor:
+        if not session.last_search or not session.next_cursors:
             return [text("There are no more results for the last search.")]
-        request = {**session.last_search, "pagination": {"limit": PAGE_SIZE, "cursor": session.next_cursor}}
-        return self.show_results(session, request, await self.call_tool("search_catalog", request))
+        stores = [self.registry.get(store_id) for store_id in session.next_cursors]
+        cursors = dict(session.next_cursors)
+        session.next_cursors = {}
+        limit = PAGE_SIZE if len(stores) == 1 else MIN_PER_STORE
+        results = await asyncio.gather(
+            *(self.search_store(m, session.last_search, limit, cursors[m.id]) for m in stores), return_exceptions=True
+        )
+        return self.show_results(session, session.last_search, list(zip(stores, results)),
+                                 f"Next page from {', '.join(m.name for m in stores)}.")
 
-    def show_results(self, session: Session, request: dict, response: dict) -> Blocks:
-        products = within_price(response.get("products") or [], (request.get("filters") or {}).get("price"))
-        pagination = response.get("pagination") or {}
-        session.last_search = {k: v for k, v in request.items() if k != "pagination"}
-        session.next_cursor = pagination.get("cursor") if pagination.get("has_next_page") else None
+    def show_results(self, session: Session, request: dict, results: list[tuple[Merchant, dict | BaseException]],
+                     why: str) -> Blocks:
+        price = (request.get("filters") or {}).get("price")
+        products, counts, problems = [], [], []
+        for merchant, response in results:
+            if isinstance(response, BaseException):
+                problems.append(notice("warning", f"{merchant.name} couldn't be searched: {response}"))
+                continue
+            found = within_price(response.get("products") or [], price, self.currency)
+            for product in found:
+                product[STORE_KEY] = merchant.id
+            products += found
+            counts.append(f"{merchant.name} {len(found)}")
+            pagination = response.get("pagination") or {}
+            if pagination.get("has_next_page") and pagination.get("cursor"):
+                session.next_cursors[merchant.id] = pagination["cursor"]
+            problems += notices(response.get("messages"))
+
+        summary = f"{why} Results per store: {', '.join(counts) or 'none'}."
         if not products:
-            more = " (more pages are available)" if session.next_cursor else ""
-            return [text(f"No products matched{more}."), *notices(response.get("messages"))]
+            more = " More pages are available." if session.next_cursors else ""
+            return [text(f"No products matched. {summary}{more}"), *problems]
         session.products = products
-        cards = {"type": "products", "products": [product_card(p) for p in products]}
-        found = "1 product" if len(products) == 1 else f"{len(products)} products"
-        return [text(f"Found {found}."), cards, *notices(response.get("messages"))]
+        cards = {"type": "products", "products": [product_card(p, self.store_of(p).name) for p in products]}
+        return [text(f"Found {len(products)} products. {summary}"), cards, *problems]
 
     async def detail(self, session: Session, product_id: str, option_label: str | None = None) -> Blocks:
+        known = self.find_product(session, product_id)
+        if not known:
+            return [notice("warning", "Search for the product first, then ask for its details.")]
+        merchant = self.store_of(known)
         request: dict = {"id": product_id, "context": {"currency": self.currency}}
         if option_label:
             # UCP get_product selects an option by its name and label, e.g. Color: Navy.
-            known = next((p for p in [session.detail, *session.products] if p and p["id"] == product_id), {})
             option = next((o["name"] for o in known.get("options") or []
                            for v in o.get("values") or [] if v["label"].lower() == option_label.lower()), None)
             if not option:
                 return [text(f"“{option_label}” isn't an option for this product.")]
             request["selected"] = [{"name": option, "label": option_label}]
 
-        response = await self.call_tool("get_product", request)
+        response = await self.call_tool(merchant, "get_product", {"catalog": request})
         product = response.get("product")
         if not product:
             return notices(response.get("messages")) or [text("That product couldn't be loaded.")]
+        product[STORE_KEY] = merchant.id
         session.detail = product
-        return [product_detail(product), *notices(response.get("messages"))]
+        return [product_detail(product, merchant.name), *notices(response.get("messages"))]
 
     # ---------------------------------------------------------------- cart
 
@@ -396,104 +489,144 @@ class Shop:
         return next((p for p in [session.detail, *session.products] if p and p["id"] == product_id), None)
 
     @staticmethod
-    def cart_lines(session: Session) -> dict[str, int]:
-        """The current cart as {variant id: quantity}."""
-        return {line["item"]["id"]: line["quantity"] for line in (session.cart or {}).get("line_items") or []}
+    def cart_lines(session: Session, store_id: str) -> dict[str, int]:
+        """A store's cart as {variant id: quantity}."""
+        cart = session.carts.get(store_id) or {}
+        return {line["item"]["id"]: line["quantity"] for line in cart.get("line_items") or []}
 
     async def add_to_cart(self, session: Session, product_id: str, variant_id: str | None, quantity: int) -> Blocks:
         product = self.find_product(session, product_id)
         if not product:
             return [notice("warning", "Show the product first, then add it.")]
+        merchant = self.store_of(product)
+        if not merchant.supports(CART):
+            where = f" It can be bought on the store's site: {product['url']}" if product.get("url") else ""
+            return [notice("warning", f"{merchant.name} doesn't offer a cart over UCP, so this can't be added here.{where}")]
         variants = product.get("variants") or []
         variant = next((v for v in variants if v["id"] == variant_id), variants[0])
-        lines = self.cart_lines(session)
+        lines = self.cart_lines(session, merchant.id)
         lines[variant["id"]] = lines.get(variant["id"], 0) + quantity
         name = f"{product['title']} ({variant['title']})" if len(variants) > 1 else product["title"]
-        return await self.save_cart(session, lines, f"Added {name} × {quantity}.")
+        return await self.save_cart(session, merchant, lines, f"Added {name} × {quantity} to the {merchant.name} cart.")
 
     async def set_quantity(self, session: Session, variant_id: str, quantity: int) -> Blocks:
         """Set one cart line's quantity; 0 removes it."""
-        lines = self.cart_lines(session)
-        if variant_id not in lines:
-            return [notice("warning", "That item isn't in the cart.")]
+        store_id = next((s for s in session.carts if variant_id in self.cart_lines(session, s)), None)
+        if not store_id:
+            return [notice("warning", "That item isn't in any cart.")]
+        lines = self.cart_lines(session, store_id)
         if quantity > 0:
             lines[variant_id] = quantity
         else:
             lines.pop(variant_id)
-        return await self.save_cart(session, lines, "Cart updated.")
+        merchant = self.registry.get(store_id)
+        return await self.save_cart(session, merchant, lines, f"{merchant.name} cart updated.")
 
-    async def save_cart(self, session: Session, lines: dict[str, int], message: str) -> Blocks:
+    async def empty_carts(self, session: Session) -> Blocks:
+        if not session.carts:
+            return [text("The cart is empty."), cart_block(None)]
+        blocks: Blocks = []
+        for store_id in list(session.carts):
+            blocks += await self.save_cart(session, self.registry.get(store_id), {}, "")
+        return [text("All carts are now empty."), *[b for b in blocks if b["type"] != "text"]]
+
+    async def save_cart(self, session: Session, merchant: Merchant, lines: dict[str, int], message: str) -> Blocks:
         """
-        Create the cart, or replace its contents. UCP update_cart is a full
+        Create the store's cart, or replace its contents. UCP update_cart is a full
         replacement, so every line (and the context) is sent each time.
         """
         items = [{"item": {"id": variant_id}, "quantity": qty} for variant_id, qty in lines.items()]
         cart = {"line_items": items, "context": self.cart_context}
-        session.checkout = None  # an open checkout no longer matches the cart; Checkout starts a new one
+        if session.checkout_store == merchant.id:
+            # An open checkout no longer matches the cart; Checkout starts a new one.
+            session.checkout = session.checkout_store = None
 
         response = None
-        if session.cart:
-            response = await self.call_store_tool("update_cart", {"id": session.cart["id"], "cart": cart})
+        existing = session.carts.get(merchant.id)
+        if existing:
+            response = await self.call_tool(merchant, "update_cart", {"id": existing["id"], "cart": cart})
             if is_not_found(response):  # expired or cancelled on the store's side; start a new cart
-                session.cart = response = None
-        if not session.cart:
+                session.carts.pop(merchant.id)
+                existing = response = None
+        if not existing:
             if not items:
-                return [text("The cart is empty."), cart_block(None)]
-            response = await self.call_store_tool("create_cart", {"cart": cart})
+                return [text(f"The {merchant.name} cart is empty."), cart_block(None, merchant.name)]
+            response = await self.call_tool(merchant, "create_cart", {"cart": cart})
 
         if is_error(response) or not response.get("id"):
-            return notices(response.get("messages")) or [notice("error", "The store couldn't update the cart.")]
-        session.cart = response
-        return [text(message), cart_block(response), *notices(response.get("messages"))]
+            return notices(response.get("messages")) or [notice("error", f"{merchant.name} couldn't update the cart.")]
+        if items:
+            session.carts[merchant.id] = response
+        else:
+            session.carts.pop(merchant.id, None)
+        return [text(message), cart_block(response, merchant.name), *notices(response.get("messages"))]
 
     async def view_cart(self, session: Session) -> Blocks:
-        if not session.cart:
+        if not session.carts:
             return [text("The cart is empty."), cart_block(None)]
 
-        response = await self.call_store_tool("get_cart", {"id": session.cart["id"]})
-        if is_not_found(response):
-            session.cart = None
-            return [text("The cart has expired, so it's empty now."), cart_block(None)]
-        if is_error(response):
-            return notices(response.get("messages")) or [notice("error", "The store couldn't load the cart.")]
-
-        session.cart = response
-        blocks = [cart_block(response), *notices(response.get("messages"))]
-
-        # Checkout hand-off to the store is switched off for now; uncomment to show it.
-        # UCP gives the cart a continue_url for finishing the purchase on the store's site.
-        # if response.get("continue_url"):
-        #     blocks.append(text(f"[Check out on {self.store_name}]({response['continue_url']})"))
-
-        return blocks
+        blocks: Blocks = []
+        for store_id, cart in list(session.carts.items()):
+            merchant = self.registry.get(store_id)
+            response = await self.call_tool(merchant, "get_cart", {"id": cart["id"]})
+            if is_not_found(response):
+                session.carts.pop(store_id)
+                blocks.append(text(f"The {merchant.name} cart has expired, so it's empty now."))
+            elif is_error(response):
+                blocks += notices(response.get("messages")) or [notice("error", f"{merchant.name} couldn't load the cart.")]
+            else:
+                session.carts[store_id] = response
+                blocks += [text(f"{merchant.name} cart:"), cart_block(response, merchant.name),
+                           *notices(response.get("messages"))]
+        return blocks or [text("The cart is empty."), cart_block(None)]
 
     # ------------------------------------------------------------ checkout
 
-    async def start_checkout(self, session: Session) -> Blocks:
-        if not cart_state(session.cart)["cart_count"]:
+    async def start_checkout(self, session: Session, store_id: str | None) -> Blocks:
+        with_items = [s for s, cart in session.carts.items() if cart_count(cart)]
+        if not with_items:
             return [text("The cart is empty, so there is nothing to check out.")]
+        if not store_id:
+            if len(with_items) > 1:
+                names = " and ".join(self.registry.get(s).name for s in with_items)
+                return [text(f"There are carts at {names}. Each store checks out separately: "
+                             "ask the shopper which store to check out first.")]
+            store_id = with_items[0]
+        if store_id not in with_items:
+            return [text(f"There's nothing in the {self.registry.get(store_id).name} cart to check out.")]
+        if session.checkout and session.checkout_store != store_id:
+            open_at = self.registry.get(session.checkout_store).name
+            return [text(f"A checkout is already open at {open_at}. Finish or cancel it before starting another.")]
 
+        merchant = self.registry.get(store_id)
+        if not merchant.supports(CHECKOUT):
+            return [notice("warning", f"{merchant.name} doesn't offer checkout over UCP.")]
         # UCP: a checkout can be created from the cart; the store takes the items from it.
-        response = await self.call_store_tool(
-            "create_checkout", {"checkout": {"cart_id": session.cart["id"], "line_items": []}}
+        response = await self.call_tool(
+            merchant, "create_checkout", {"checkout": {"cart_id": session.carts[store_id]["id"], "line_items": []}}
         )
         if is_not_found(response):
-            session.cart = None
-            return [text("The cart has expired, so there is nothing to check out.")]
+            session.carts.pop(store_id)
+            return [text(f"The {merchant.name} cart has expired, so there is nothing to check out.")]
 
         session.delivery_option = None
+        session.checkout_store = store_id
         if response.get("id") and (session.buyer or session.address):
             # Reuse details the shopper already gave in this chat.
             session.checkout = response
-            response = await self.call_store_tool(
-                "update_checkout", {"id": response["id"], "checkout": self.checkout_payload(session)}
+            response = await self.call_tool(
+                merchant, "update_checkout", {"id": response["id"], "checkout": self.checkout_payload(session)}
             )
         return self.checkout_reply(session, response)
+
+    def checkout_merchant(self, session: Session) -> Merchant:
+        return self.registry.get(session.checkout_store)
 
     async def view_checkout(self, session: Session) -> Blocks:
         if not session.checkout:
             return [text("There's no checkout open.")]
-        return self.checkout_reply(session, await self.call_store_tool("get_checkout", {"id": session.checkout["id"]}))
+        response = await self.call_tool(self.checkout_merchant(session), "get_checkout", {"id": session.checkout["id"]})
+        return self.checkout_reply(session, response)
 
     async def update_checkout(self, session: Session, details: dict) -> Blocks:
         """
@@ -532,21 +665,24 @@ class Shop:
         return await self.send_checkout(session)
 
     async def send_checkout(self, session: Session) -> Blocks:
-        response = await self.call_store_tool(
-            "update_checkout", {"id": session.checkout["id"], "checkout": self.checkout_payload(session)}
+        response = await self.call_tool(
+            self.checkout_merchant(session), "update_checkout",
+            {"id": session.checkout["id"], "checkout": self.checkout_payload(session)},
         )
         return self.checkout_reply(session, response)
 
     async def cancel_checkout(self, session: Session) -> Blocks:
         if not session.checkout:
             return [text("There's no checkout open.")]
-        await self.call_store_tool("cancel_checkout", {"id": session.checkout["id"]})
-        session.checkout = None
+        merchant = self.checkout_merchant(session)
+        await self.call_tool(merchant, "cancel_checkout", {"id": session.checkout["id"]})
+        session.checkout = session.checkout_store = None
         session.delivery_option = None
         # The store may close the cart together with its checkout.
-        if session.cart and is_not_found(await self.call_store_tool("get_cart", {"id": session.cart["id"]})):
-            session.cart = None
-        return [text("Checkout cancelled.")]
+        cart = session.carts.get(merchant.id)
+        if cart and is_not_found(await self.call_tool(merchant, "get_cart", {"id": cart["id"]})):
+            session.carts.pop(merchant.id)
+        return [text(f"{merchant.name} checkout cancelled.")]
 
     def checkout_payload(self, session: Session) -> dict:
         """The whole checkout, as UCP update_checkout expects (it replaces the previous state)."""
@@ -576,11 +712,14 @@ class Shop:
 
     def checkout_reply(self, session: Session, response: dict) -> Blocks:
         """Show the checkout and say what the store still needs."""
+        merchant = self.checkout_merchant(session)
         if is_not_found(response):
-            session.checkout = None
+            session.checkout = session.checkout_store = None
             return [text("That checkout has expired. Start the checkout again.")]
         if not response.get("id"):
-            return notices(response.get("messages")) or [notice("error", "The store couldn't open a checkout.")]
+            if not session.checkout:
+                session.checkout_store = None
+            return notices(response.get("messages")) or [notice("error", f"{merchant.name} couldn't open a checkout.")]
 
         session.checkout = response
         # UCP: "recoverable" errors are fixed with update_checkout. Anything needing the buyer on the
@@ -594,16 +733,17 @@ class Shop:
         if session.address:
             needed += [f"Recipient {name.replace('_', ' ')}" for name in missing_recipient(session)]
 
-        blocks = [checkout_block(response, {**session.buyer, **session.address})]
+        blocks = [checkout_block(response, {**session.buyer, **session.address}, merchant.name)]
         if needed:
-            blocks.append(text("Still needed: " + "; ".join(needed)))
+            blocks.append(text(f"{merchant.name} still needs: " + "; ".join(needed)))
         else:
-            blocks.append(text("The checkout details are complete. Payment isn't enabled, so checkout stops here."))
+            blocks.append(text(f"The {merchant.name} checkout details are complete. "
+                               "Payment isn't enabled, so checkout stops here."))
         # Hand-off to the store's own payment page (UCP continue_url); uncomment to bring it back.
         # elif response.get("continue_url"):
         #     blocks.append(text(
         #         f"Everything that can be filled in here is done. Payment and placing the order happen on "
-        #         f"{self.store_name}'s own checkout page: "
-        #         f"[Continue to payment on {self.store_name}]({response['continue_url']})"
+        #         f"{merchant.name}'s own checkout page: "
+        #         f"[Continue to payment on {merchant.name}]({response['continue_url']})"
         #     ))
         return blocks

@@ -1,0 +1,61 @@
+{
+  "merchants": [
+    {
+      "id": "pier1",
+      "name": "Pier 1",
+      "url": "https://www.pier1.com",
+      "categories": [
+        "home decoration",
+        "rugs",
+        "furniture",
+        "dining room sets",
+        "papasan chairs",
+        "outdoor living",
+        "indoor styling",
+        "accessories",
+        "seasons",
+        "holidays",
+        "birthdays"
+      ]
+    },
+    {
+      "id": "allbirds",
+      "name": "Allbirds",
+      "url": "https://www.allbirds.com",
+      "categories": [
+        "shoes",
+        "footwear",
+        "sneakers",
+        "sandals",
+        "slipons"
+      ]
+    },
+    {
+      "id": "autoxpert",
+      "name": "Auto-Xpert",
+      "url": "https://auto-xpert.co.uk",
+      "categories": [
+        "car care",
+        "car cleaning",
+        "car detailing",
+        "car accessories",
+        "car interior",
+        "car exterior",
+        "car parts"
+      ]
+    },
+    {
+      "id": "furniturecity",
+      "name": "Furniture City",
+      "url": "https://furniturecity.com",
+      "categories": [
+        "furniture",
+        "sofas",
+        "sectionals",
+        "bedroom sets",
+        "dining sets",
+        "mattresses"
+      ]
+    }
+  ]
+}

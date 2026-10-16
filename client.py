@@ -1,27 +1,28 @@
-"""UCP client (platform) for the Pier 1 store, and the backend of ucp-frontend.
+"""UCP client (platform) for the stores in merchants.json, and the backend of ucp-frontend.
 
-On startup it opens an ngrok tunnel so the store can fetch our UCP profile, reads the
-store's /.well-known/ucp and finds its MCP endpoint. Every store call then goes through
-call_mcp(), which adds meta.ucp-agent (and an idempotency key where UCP requires one),
-logs the call and records it for the frontend's protocol log.
+On startup it opens an ngrok tunnel so the stores can fetch our UCP profile, then reads
+each store's /.well-known/ucp to find its MCP endpoint (merchants.py). Every store call
+goes through call_mcp(), which adds meta.ucp-agent (and an idempotency key where UCP
+requires one), logs the call and records it for the frontend's protocol log.
 
     GET  /profile.json                our UCP platform profile
     POST /api/chat                    one chat turn (agent.py + shop.py)
     POST /api/checkout/details        the checkout card's delivery details form
-    GET  /api/health                  status of this client and the store
+    GET  /api/health                  status of this client and the stores
+    GET  /api/merchants               the stores, their categories and what discovery found
     GET  /api/exchanges               recent store calls (protocol log)
     DELETE /api/exchanges
-    POST /api/mcp/catalog/...         direct catalog, cart and checkout calls
-    POST /api/mcp/cart/...
+    POST /api/mcp/catalog/...         direct catalog, cart and checkout calls to one store,
+    POST /api/mcp/cart/...            chosen with ?merchant=<id> (default pier1)
     POST /api/mcp/checkout/...
 
 Run:  uv run python client.py
 """
 
+import asyncio
 import hashlib
 import json
 import logging
-import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -48,6 +49,7 @@ from ucp_sdk.models.schemas.shopping.checkout_update_request import CheckoutUpda
 from ucp_sdk.models.schemas.shopping.types.line_item_create_request import LineItemCreateRequest
 
 from agent import Agent
+from merchants import Merchant, Registry
 from shop import Shop
 
 load_dotenv()
@@ -61,11 +63,10 @@ for noisy in ("pyngrok", "httpx", "httpx2", "mcp"):
 
 PORT = 7000
 PROFILE_PATH = Path(__file__).parent / "profile.json"
-STORE_NAME = "Pier 1"
-STORE_CURRENCY = "USD"
-STORE_COUNTRY = "US"  # prices carts in USD, like the catalog
-# The business we shop from. Its MCP endpoint is read from its /.well-known/ucp on startup.
-BUSINESS_BASE_URL = "https://www.pier1.com"
+CURRENCY = ""
+COUNTRY = ""  # prices carts in USD, like the catalog
+# The store used by the direct /api/mcp/... endpoints when no ?merchant= is given.
+DEFAULT_MERCHANT = "pier1"
 
 TOOL_CAPABILITIES = {
     "search_catalog": "dev.ucp.shopping.catalog.search",
@@ -85,52 +86,20 @@ TOOL_CAPABILITIES = {
 # The UCP spec requires meta.idempotency-key for these tools.
 IDEMPOTENT_TOOLS = {"cancel_cart", "complete_checkout", "cancel_checkout"}
 
-# Set on startup: our public URL (ngrok) and the business's MCP endpoint.
+# Set on startup: our public URL (ngrok).
 public_url: str | None = None
-MCP_CLIENT_URL: str | None = None
 
-# Recent calls to the store, newest first, for the frontend's protocol log.
+# The stores, from merchants.json; discovered on startup.
+registry = Registry()
+
+# Recent calls to the stores, newest first, for the frontend's protocol log.
 exchanges: list[dict] = []
 MAX_EXCHANGES = 200
-
-# The business profile, cached as UCP recommends (at least 60 seconds, or the
-# profile's own Cache-Control max-age if longer).
-MIN_PROFILE_TTL = 60
-profile_cache: dict = {"profile": None, "expires": 0.0}
-
-
-# ----------------------------------------------------------- discovery
-
-
-async def fetch_business_profile() -> dict:
-    if profile_cache["profile"] and time.monotonic() < profile_cache["expires"]:
-        return profile_cache["profile"]
-
-    # UCP: platforms must not follow redirects when fetching a business profile.
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as http:
-        resp = await http.get(f"{BUSINESS_BASE_URL}/.well-known/ucp", headers={"Accept": "application/json"})
-        resp.raise_for_status()
-        profile = resp.json()
-
-    max_age = re.search(r"max-age=(\d+)", resp.headers.get("cache-control", ""))
-    ttl = max(MIN_PROFILE_TTL, int(max_age[1]) if max_age else 0)
-    profile_cache.update(profile=profile, expires=time.monotonic() + ttl)
-    return profile
-
-
-def extract_mcp_endpoint(business_profile: dict) -> str:
-    """Find the MCP endpoint in a business's /.well-known/ucp profile."""
-    services = business_profile.get("ucp", {}).get("services", {}).get("dev.ucp.shopping", [])
-    for service in services:
-        if service.get("transport") == "mcp" and service.get("endpoint"):
-            return service["endpoint"].rstrip("/")
-    available = [s.get("transport") for s in services]
-    raise RuntimeError(f"Merchant does not expose an MCP transport endpoint (available: {available})")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global public_url, MCP_CLIENT_URL
+    global public_url
 
     # 1. Start the tunnel, so the store can fetch our profile.
     try:
@@ -143,9 +112,10 @@ async def lifespan(app: FastAPI):
     public_url = ngrok_tunnel.public_url
     logger.info(f"Public profile URL: {public_url}/profile.json")
 
-    # 2. Fetch the business's profile and find its MCP endpoint.
-    MCP_CLIENT_URL = extract_mcp_endpoint(await fetch_business_profile())
-    logger.info(f"Store: {STORE_NAME}, discovered MCP endpoint: {MCP_CLIENT_URL}")
+    # 2. Read each store's /.well-known/ucp for its MCP endpoint, version and capabilities.
+    await registry.discover_all(read_profile())
+    available = [m.name for m in registry.all() if not m.error]
+    logger.info(f"{len(available)} of {len(registry.all())} stores available: {', '.join(available)}")
     logger.info(f"Ready on http://localhost:{PORT} - start the frontend and open http://localhost:5173")
 
     yield
@@ -195,12 +165,14 @@ def summarize(response: dict) -> str:
     return ", ".join(parts) or "empty response"
 
 
-def log_exchange(tool: str, arguments: dict, started: float, status: int, response=None, error=None):
+def log_exchange(merchant: Merchant, tool: str, arguments: dict, started: float, status: int,
+                 response=None, error=None):
     exchanges.insert(0, {
         "id": str(uuid.uuid4()),
+        "merchant": merchant.id,
         "capability": TOOL_CAPABILITIES.get(tool, "discovery"),
         "method": tool,
-        "url": MCP_CLIENT_URL,
+        "url": merchant.endpoint,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
         "ok": error is None and (response or {}).get("ucp", {}).get("status") != "error",
@@ -213,9 +185,9 @@ def log_exchange(tool: str, arguments: dict, started: float, status: int, respon
     del exchanges[MAX_EXCHANGES:]
 
 
-async def call_mcp(tool: str, arguments: dict) -> dict:
+async def call_mcp(merchant: Merchant, tool: str, arguments: dict) -> dict:
     """
-    Call one of the store's UCP MCP tools and return its JSON result.
+    Call one of a store's UCP MCP tools and return its JSON result.
     `arguments` are the tool's own parameters; the `meta` block is added here,
     with an idempotency key for the tools whose spec requires one.
     """
@@ -224,10 +196,10 @@ async def call_mcp(tool: str, arguments: dict) -> dict:
         meta["idempotency-key"] = str(uuid.uuid4())
     arguments = {"meta": meta, **arguments}
 
-    logger.info(f"  -> {tool} {json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
+    logger.info(f"  -> {merchant.id}.{tool} {json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
     started = time.perf_counter()
     try:
-        async with Client(MCP_CLIENT_URL) as mcp_client:
+        async with Client(merchant.endpoint) as mcp_client:
             result = await mcp_client.call_tool(tool, arguments)
         text = next((block.text for block in result.content if isinstance(block, TextContent)), "")
         # UCP returns its response in structuredContent; the text block is the same data as JSON.
@@ -241,19 +213,32 @@ async def call_mcp(tool: str, arguments: dict) -> dict:
             raise RuntimeError(text or "the store returned a tool error")
     except Exception as exc:
         message = error_message(exc)
-        logger.error(f"  <- {tool} failed: {message}")
-        log_exchange(tool, arguments, started, 502, error=message)
-        raise HTTPException(status_code=502, detail=f"{tool} failed: {message}")
-    log_exchange(tool, arguments, started, 200, response)
+        logger.error(f"  <- {merchant.id}.{tool} failed: {message}")
+        log_exchange(merchant, tool, arguments, started, 502, error=message)
+        raise HTTPException(status_code=502, detail=f"{merchant.name} {tool} failed: {message}")
+    log_exchange(merchant, tool, arguments, started, 200, response)
     elapsed = round((time.perf_counter() - started) * 1000)
     outcome = "returned an error" if response.get("ucp", {}).get("status") == "error" else "OK"
-    logger.info(f"  <- {tool} {outcome} in {elapsed} ms: {summarize(response)}")
+    logger.info(f"  <- {merchant.id}.{tool} {outcome} in {elapsed} ms: {summarize(response)}")
     return response
 
 
-async def call_catalog(tool: str, catalog: dict) -> dict:
+def merchant_or_404(merchant_id: str) -> Merchant:
+    merchant = registry.get(merchant_id)
+    if not merchant:
+        raise HTTPException(status_code=404, detail=f"Unknown merchant {merchant_id}")
+    if merchant.error:
+        raise HTTPException(status_code=503, detail=f"{merchant.name} is unavailable: {merchant.error}")
+    return merchant
+
+
+async def call_catalog(merchant_id: str, tool: str, catalog: dict) -> dict:
     """Catalog tools take their parameters under `catalog`."""
-    return await call_mcp(tool, {"catalog": catalog})
+    return await call_mcp(merchant_or_404(merchant_id), tool, {"catalog": catalog})
+
+
+async def call_store(merchant_id: str, tool: str, arguments: dict) -> dict:
+    return await call_mcp(merchant_or_404(merchant_id), tool, arguments)
 
 
 def check_ucp_status(response: dict, action: str) -> dict:
@@ -269,7 +254,7 @@ def check_ucp_status(response: dict, action: str) -> dict:
     raise HTTPException(status_code=status, detail=detail)
 
 
-shop = Shop(call_catalog, call_mcp, fetch_business_profile, STORE_NAME, STORE_CURRENCY, STORE_COUNTRY)
+shop = Shop(registry, call_mcp, CURRENCY, COUNTRY)
 agent = Agent(shop)
 
 
@@ -330,28 +315,42 @@ async def checkout_details(body: CheckoutDetailsRequest):
     return await agent.submit_details(body.session_id, details)
 
 
-@app.get("/api/health")
-async def health():
-    """Status of this client and of the store it talks to."""
-    store = {"reachable": False, "status": 0, "latency_ms": 0, "name": STORE_NAME}
+async def probe(merchant: Merchant) -> tuple[int, int]:
+    """A store's /.well-known/ucp status code and latency in ms (status 0 if unreachable)."""
     started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-            response = await client.get(f"{BUSINESS_BASE_URL}/.well-known/ucp")
-        store["status"] = response.status_code
-        store["reachable"] = response.status_code == 200
+            status = (await client.get(f"{merchant.url}/.well-known/ucp")).status_code
     except httpx.HTTPError:
-        pass
-    store["latency_ms"] = round((time.perf_counter() - started) * 1000)
+        status = 0
+    return status, round((time.perf_counter() - started) * 1000)
+
+
+@app.get("/api/health")
+async def health():
+    """Status of this client and of the stores it talks to (the sidebar shows one summary)."""
+    merchants = registry.all()
+    probes = await asyncio.gather(*(probe(m) for m in merchants))
+    online = [m for m, (status, _) in zip(merchants, probes) if status == 200 and not m.error]
     return {
         "agent": {
             "status": "ok",
             "version": read_profile()["ucp"]["version"],
             "profile_url": f"{public_url}/profile.json",
-            "merchant_url": BUSINESS_BASE_URL,
+            "merchant_url": ", ".join(m.url for m in merchants),
         },
-        "merchant": store,
+        "merchant": {
+            "reachable": bool(online),
+            "status": 200 if online else 0,
+            "latency_ms": max(latency for _, latency in probes),
+            "name": f"{len(online)} of {len(merchants)} stores online",
+        },
     }
+
+
+@app.get("/api/merchants")
+async def list_merchants():
+    return [m.summary() for m in registry.all()]
 
 
 @app.get("/api/exchanges")
@@ -407,14 +406,14 @@ class CancelCheckoutRequest(BaseModel):
 
 
 @app.post("/api/mcp/catalog/search/")
-async def search_products_mcp(query: SearchRequest):
+async def search_products_mcp(query: SearchRequest, merchant: str = DEFAULT_MERCHANT):
     """Search products via an MCP client."""
-    response = await call_catalog("search_catalog", {"query": query.query})
+    response = await call_catalog(merchant, "search_catalog", {"query": query.query})
     return response.get("products")
 
 
 @app.post("/api/mcp/catalog/lookup")
-async def lookup_products_mcp(request: LookupRequest):
+async def lookup_products_mcp(request: LookupRequest, merchant: str = DEFAULT_MERCHANT):
     """
     Lookup one or more products via an MCP client.
     Requires a list of one or more valid product IDs.
@@ -423,7 +422,7 @@ async def lookup_products_mcp(request: LookupRequest):
         2. Partial success: Not all specified products were found. Messages data indicates which products could not be found and why.
         3. Error: Not a single product specified by the product IDs could be found.
     """
-    response = await call_catalog("lookup_catalog", {"ids": sorted(set(request.ids))})
+    response = await call_catalog(merchant, "lookup_catalog", {"ids": sorted(set(request.ids))})
     products = response.get("products") or []
     messages = response.get("messages") or []
     if not products:
@@ -438,8 +437,8 @@ async def lookup_products_mcp(request: LookupRequest):
 
 
 @app.post("/api/mcp/catalog/product")
-async def get_product_detail(request: GetProductRequest):
-    response = await call_catalog("get_product", {"id": request.id})
+async def get_product_detail(request: GetProductRequest, merchant: str = DEFAULT_MERCHANT):
+    response = await call_catalog(merchant, "get_product", {"id": request.id})
     if response.get("product"):
         return response["product"]
     logger.info("No products found. Ensure entered IDs are valid.")
@@ -447,44 +446,44 @@ async def get_product_detail(request: GetProductRequest):
 
 
 @app.post("/api/mcp/cart/create")
-async def create_cart_mcp(request: CartCreateRequest):
+async def create_cart_mcp(request: CartCreateRequest, merchant: str = DEFAULT_MERCHANT):
     """
     Create a new cart via an MCP client.
     Expects a list of Variant IDs and quantities.
     """
     cart = request.model_dump(mode="json", exclude_none=True)
-    return check_ucp_status(await call_mcp("create_cart", {"cart": cart}), "Cart creation")
+    return check_ucp_status(await call_store(merchant, "create_cart", {"cart": cart}), "Cart creation")
 
 
 @app.post("/api/mcp/cart/get")
-async def get_cart_mcp(request: GetCartRequest):
+async def get_cart_mcp(request: GetCartRequest, merchant: str = DEFAULT_MERCHANT):
     """
     Fetch an existing cart via an MCP client.
     Expects a valid Cart ID.
     """
-    return check_ucp_status(await call_mcp("get_cart", {"id": request.id}), "Cart fetch")
+    return check_ucp_status(await call_store(merchant, "get_cart", {"id": request.id}), "Cart fetch")
 
 
 @app.post("/api/mcp/cart/update")
-async def update_cart_mcp(request: MCPUpdateCartRequest):
+async def update_cart_mcp(request: MCPUpdateCartRequest, merchant: str = DEFAULT_MERCHANT):
     """
     Update an existing cart via an MCP client.
     UCP: the platform must send the entire cart; line_items fully replaces the cart's contents.
     """
     cart = request.cart.model_dump(mode="json", exclude_none=True)
-    return check_ucp_status(await call_mcp("update_cart", {"id": request.id, "cart": cart}), "Cart update")
+    return check_ucp_status(await call_store(merchant, "update_cart", {"id": request.id, "cart": cart}), "Cart update")
 
 
 @app.post("/api/mcp/cart/cancel")
-async def cancel_cart_mcp(request: CancelCartRequest):
+async def cancel_cart_mcp(request: CancelCartRequest, merchant: str = DEFAULT_MERCHANT):
     """Cancel an existing cart via an MCP client."""
-    response = check_ucp_status(await call_mcp("cancel_cart", {"id": request.id}), "Cart cancellation")
+    response = check_ucp_status(await call_store(merchant, "cancel_cart", {"id": request.id}), "Cart cancellation")
     logger.info(f"Cart cancelled: {request.id}")
     return response
 
 
 @app.post("/api/mcp/checkout/create")
-async def create_checkout_mcp(request: CheckoutCreateMCPRequest):
+async def create_checkout_mcp(request: CheckoutCreateMCPRequest, merchant: str = DEFAULT_MERCHANT):
     """
     Create a checkout via an MCP client.
     Accepts either a cart_id (cart-to-checkout conversion) or line_items directly.
@@ -495,34 +494,34 @@ async def create_checkout_mcp(request: CheckoutCreateMCPRequest):
     if checkout.get("cart_id"):
         # The store takes the items from the cart; line_items is still a required field.
         checkout.setdefault("line_items", [])
-    return check_ucp_status(await call_mcp("create_checkout", {"checkout": checkout}), "Checkout creation")
+    return check_ucp_status(await call_store(merchant, "create_checkout", {"checkout": checkout}), "Checkout creation")
 
 
 @app.post("/api/mcp/checkout/get")
-async def get_checkout_mcp(request: GetCheckoutRequest):
+async def get_checkout_mcp(request: GetCheckoutRequest, merchant: str = DEFAULT_MERCHANT):
     """
     Fetch an existing checkout via an MCP client.
     Expects a valid Checkout ID.
     """
-    return check_ucp_status(await call_mcp("get_checkout", {"id": request.id}), "Checkout fetch")
+    return check_ucp_status(await call_store(merchant, "get_checkout", {"id": request.id}), "Checkout fetch")
 
 
 @app.post("/api/mcp/checkout/update")
-async def update_checkout_mcp(request: MCPUpdateCheckoutRequest):
+async def update_checkout_mcp(request: MCPUpdateCheckoutRequest, merchant: str = DEFAULT_MERCHANT):
     """
     Update an existing checkout via an MCP client.
     Note: The checkout payload is a full replacement of the session state.
     """
     checkout = request.checkout.model_dump(mode="json", exclude_none=True)
     return check_ucp_status(
-        await call_mcp("update_checkout", {"id": request.id, "checkout": checkout}), "Checkout update"
+        await call_store(merchant, "update_checkout", {"id": request.id, "checkout": checkout}), "Checkout update"
     )
 
 
 # Payment is switched off for now; uncomment to bring back placing the order
 # (also uncomment MCPCompleteCheckoutRequest and the CheckoutCompleteRequest import).
 # @app.post("/api/mcp/checkout/complete")
-# async def complete_checkout_mcp(request: MCPCompleteCheckoutRequest):
+# async def complete_checkout_mcp(request: MCPCompleteCheckoutRequest, merchant: str = DEFAULT_MERCHANT):
 #     """
 #     Complete a checkout (place the order) via an MCP client.
 #     Expects a valid Checkout ID and payment details.
@@ -530,15 +529,15 @@ async def update_checkout_mcp(request: MCPUpdateCheckoutRequest):
 #     """
 #     checkout = request.checkout.model_dump(mode="json", exclude_none=True)
 #     return check_ucp_status(
-#         await call_mcp("complete_checkout", {"id": request.id, "checkout": checkout}),
+#         await call_store(merchant, "complete_checkout", {"id": request.id, "checkout": checkout}),
 #         "Checkout completion",
 #     )
 
 
 @app.post("/api/mcp/checkout/cancel")
-async def cancel_checkout_mcp(request: CancelCheckoutRequest):
+async def cancel_checkout_mcp(request: CancelCheckoutRequest, merchant: str = DEFAULT_MERCHANT):
     """Cancel an existing checkout via an MCP client."""
-    response = check_ucp_status(await call_mcp("cancel_checkout", {"id": request.id}), "Checkout cancellation")
+    response = check_ucp_status(await call_store(merchant, "cancel_checkout", {"id": request.id}), "Checkout cancellation")
     logger.info(f"Checkout cancelled: {request.id}")
     return response
 
