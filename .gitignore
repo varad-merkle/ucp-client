@@ -1,24 +1,37 @@
-# Virtual environments
+# Virtual environment
 .venv/
 venv/
+env/
 
-# Local environment variables
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment variables (may contain API keys)
 .env
 .env.*
 !.env.example
 
-# Python bytecode and caches
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+# Buyer profile database — contains personal data; do not commit
+buyer_profile.db
+*.db
 
-# Build artifacts
-build/
+# Test databases
+tests/*.db
+
+# Distribution / packaging
 dist/
+build/
 *.egg-info/
 
-# Logs
-*.log
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

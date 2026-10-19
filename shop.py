@@ -9,6 +9,15 @@ every product is tagged with its store, and each store has its own cart. UCP car
 and checkouts belong to one business, so there is one checkout per store, and one
 open at a time.
 
+Market context (currency, country, language, region, postal_code) is read from the
+persisted buyer profile (profile_store.py) on each relevant UCP call. Buyer info
+(name, email, phone) is pre-filled from the profile when a checkout starts if the
+session has not yet collected those details.
+
+Request-level signals (IP address, User-Agent) are stored on the session and forwarded
+to UCP calls that accept a `signals` field, per the official schema. They are never
+stored in the profile database.
+
 Payment is not enabled: checkout stops at reviewing the details.
 """
 
@@ -65,6 +74,9 @@ class Session:
     address: dict = field(default_factory=dict)
     delivery_option: str | None = None
     history: list[dict] = field(default_factory=list)  # earlier messages, for the model
+    # IP address and User-Agent from the most recent HTTP request for this session.
+    # These are forwarded in the UCP `signals` field; never stored in the profile DB.
+    signals: dict = field(default_factory=dict)
 
 
 # ------------------------------------------------------------------ blocks
@@ -214,10 +226,11 @@ def line_view(line: dict) -> dict:
 def cart_block(cart: dict | None, store: str | None = None) -> dict:
     """A UCP cart as the frontend's cart card (an empty card when there is no cart)."""
     cart = cart or {}
+    # Use the merchant's actual currency; fall back to empty string (not a hardcoded USD).
     return {
         "type": "cart",
         "store": store,
-        "currency": cart.get("currency", "USD"),
+        "currency": cart.get("currency", ""),
         "subtotal": total_of(cart.get("totals"), "subtotal"),
         "lines": [line_view(line) for line in cart.get("line_items") or []],
     }
@@ -261,7 +274,8 @@ def checkout_block(checkout: dict, given: dict | None = None, store: str | None 
             "store": store,
             "id": checkout["id"],
             "status": checkout.get("status", ""),
-            "currency": checkout.get("currency", "USD"),
+            # Use the merchant's actual currency; fall back to empty string (not a hardcoded USD).
+            "currency": checkout.get("currency", ""),
             "line_items": [line_view(line) for line in checkout.get("line_items") or []],
             "totals": checkout.get("totals") or [],
             "buyer": checkout.get("buyer") or {},
@@ -315,7 +329,7 @@ def singular(word: str) -> str:
     return word
 
 
-def within_price(products: list[dict], price: dict | None, currency: str) -> list[dict]:
+def within_price(products: list[dict], price: dict | None, currency: str | None) -> list[dict]:
     """
     The store's price filter is loose, so check each product's lowest price again.
     Prices in another currency can't be compared, so those products are kept.
@@ -349,14 +363,52 @@ def missing_recipient(session: Session) -> list[str]:
 
 
 class Shop:
-    def __init__(self, registry: Registry, call_tool: CallTool, currency: str | None = None, country: str | None = None):
+    def __init__(self, registry: Registry, call_tool: CallTool):
         self.registry = registry
         self.call_tool = call_tool  # (merchant, tool, tool arguments)
-        self.currency = currency
-        # Sent with every cart so the store prices it like the catalog (it would
-        # otherwise guess the shopper's country from their IP address).
-        self.cart_context = {"address_country": country, "currency": currency}
         self.sessions: dict[str, Session] = {}
+
+    def _market_context(self) -> dict:
+        """Build a UCP context dict from the persisted market preferences.
+
+        Only non-None profile values are included. The fields map to the official
+        UCP ContextCreateRequest schema (context_create_request.py in the SDK).
+        Verified supported fields: currency, address_country, language,
+        address_region, postal_code.
+        """
+        from profile_store import get_profile  # local import avoids circular deps at module load
+        market = get_profile()["market"]
+        ctx: dict = {}
+        if market.get("preferred_currency"):
+            ctx["currency"] = market["preferred_currency"]
+        if market.get("country"):
+            ctx["address_country"] = market["country"]
+        if market.get("language"):
+            ctx["language"] = market["language"]
+        if market.get("region"):
+            ctx["address_region"] = market["region"]
+        if market.get("postal_code"):
+            ctx["postal_code"] = market["postal_code"]
+        return ctx
+
+    def _profile_buyer(self) -> dict:
+        """Buyer fields from the persisted profile, mapped to UCP checkout buyer keys.
+
+        phone_number is the UCP field name (BuyerCreateRequest); the profile stores it
+        as 'phone'. Used only for pre-filling a new checkout session, not for catalog.
+        """
+        from profile_store import get_profile
+        buyer = get_profile()["buyer"]
+        result: dict = {}
+        if buyer.get("first_name"):
+            result["first_name"] = buyer["first_name"]
+        if buyer.get("last_name"):
+            result["last_name"] = buyer["last_name"]
+        if buyer.get("email"):
+            result["email"] = buyer["email"]
+        if buyer.get("phone"):
+            result["phone_number"] = buyer["phone"]  # UCP checkout uses phone_number
+        return result
 
     def session(self, session_id: str | None) -> Session:
         if session_id in self.sessions:
@@ -400,7 +452,10 @@ class Shop:
                      low: int | None, high: int | None) -> Blocks:
         stores, why = self.stores_for(categories)
         logger.info(f"Categories {categories} -> {[m.id for m in stores]}: {why}")
-        request: dict = {"context": {"currency": self.currency}}
+        ctx = self._market_context()
+        request: dict = {}
+        if ctx:
+            request["context"] = ctx
         if query:
             request["query"] = query
         if low is not None or high is not None:
@@ -408,17 +463,23 @@ class Shop:
         session.last_search = request
         session.next_cursors = {}
         limit = PAGE_SIZE if len(stores) == 1 else MIN_PER_STORE
-        results = await asyncio.gather(*(self.search_store(m, request, limit) for m in stores), return_exceptions=True)
+        results = await asyncio.gather(
+            *(self.search_store(m, request, limit, signals=session.signals or None) for m in stores),
+            return_exceptions=True,
+        )
         return self.show_results(session, request, list(zip(stores, results)), why)
 
-    async def search_store(self, merchant: Merchant, request: dict, limit: int, cursor: str | None = None) -> dict:
-        page = {"limit": limit, **({"cursor": cursor} if cursor else {})}
-        response = await self.call_tool(merchant, "search_catalog", {"catalog": {**request, "pagination": page}})
+    async def search_store(self, merchant: Merchant, request: dict, limit: int,
+                           cursor: str | None = None, signals: dict | None = None) -> dict:
+        catalog: dict = {**request, "pagination": {"limit": limit, **({"cursor": cursor} if cursor else {})}}
+        if signals:
+            catalog["signals"] = signals
+        response = await self.call_tool(merchant, "search_catalog", {"catalog": catalog})
         query = request.get("query")
         # Nothing found for "lamps"? Try "lamp".
         if not cursor and not response.get("products") and query and (simpler := " ".join(map(singular, query.split()))) != query:
-            response = await self.call_tool(merchant, "search_catalog",
-                                            {"catalog": {**request, "query": simpler, "pagination": page}})
+            catalog_retry = {**catalog, "query": simpler}
+            response = await self.call_tool(merchant, "search_catalog", {"catalog": catalog_retry})
         return response
 
     async def more(self, session: Session) -> Blocks:
@@ -429,7 +490,9 @@ class Shop:
         session.next_cursors = {}
         limit = PAGE_SIZE if len(stores) == 1 else MIN_PER_STORE
         results = await asyncio.gather(
-            *(self.search_store(m, session.last_search, limit, cursors[m.id]) for m in stores), return_exceptions=True
+            *(self.search_store(m, session.last_search, limit, cursors[m.id],
+                                signals=session.signals or None) for m in stores),
+            return_exceptions=True,
         )
         return self.show_results(session, session.last_search, list(zip(stores, results)),
                                  f"Next page from {', '.join(m.name for m in stores)}.")
@@ -437,12 +500,14 @@ class Shop:
     def show_results(self, session: Session, request: dict, results: list[tuple[Merchant, dict | BaseException]],
                      why: str) -> Blocks:
         price = (request.get("filters") or {}).get("price")
+        # Use the currency from the request context for price comparison (not a hardcoded default).
+        currency = (request.get("context") or {}).get("currency")
         products, counts, problems = [], [], []
         for merchant, response in results:
             if isinstance(response, BaseException):
                 problems.append(notice("warning", f"{merchant.name} couldn't be searched: {response}"))
                 continue
-            found = within_price(response.get("products") or [], price, self.currency)
+            found = within_price(response.get("products") or [], price, currency)
             for product in found:
                 product[STORE_KEY] = merchant.id
             products += found
@@ -465,16 +530,22 @@ class Shop:
         if not known:
             return [notice("warning", "Search for the product first, then ask for its details.")]
         merchant = self.store_of(known)
-        request: dict = {"id": product_id, "context": {"currency": self.currency}}
+        ctx = self._market_context()
+        request: dict = {"id": product_id}
+        if ctx:
+            request["context"] = ctx
         if option_label:
             # UCP get_product selects an option by its name and label, e.g. Color: Navy.
             option = next((o["name"] for o in known.get("options") or []
                            for v in o.get("values") or [] if v["label"].lower() == option_label.lower()), None)
             if not option:
-                return [text(f"“{option_label}” isn't an option for this product.")]
+                return [text(f'"{option_label}" is not a known option for this product.')]
             request["selected"] = [{"name": option, "label": option_label}]
 
-        response = await self.call_tool(merchant, "get_product", {"catalog": request})
+        catalog: dict = {**request}
+        if session.signals:
+            catalog["signals"] = session.signals
+        response = await self.call_tool(merchant, "get_product", {"catalog": catalog})
         product = response.get("product")
         if not product:
             return notices(response.get("messages")) or [text("That product couldn't be loaded.")]
@@ -534,9 +605,16 @@ class Shop:
         """
         Create the store's cart, or replace its contents. UCP update_cart is a full
         replacement, so every line (and the context) is sent each time.
+        Market context is read from the persisted profile on every cart save so that
+        preference changes take effect on the next cart operation.
         """
         items = [{"item": {"id": variant_id}, "quantity": qty} for variant_id, qty in lines.items()]
-        cart = {"line_items": items, "context": self.cart_context}
+        ctx = self._market_context()
+        cart: dict = {"line_items": items}
+        if ctx:
+            cart["context"] = ctx
+        if session.signals:
+            cart["signals"] = session.signals
         if session.checkout_store == merchant.id:
             # An open checkout no longer matches the cart; Checkout starts a new one.
             session.checkout = session.checkout_store = None
@@ -601,6 +679,14 @@ class Shop:
         merchant = self.registry.get(store_id)
         if not merchant.supports(CHECKOUT):
             return [notice("warning", f"{merchant.name} doesn't offer checkout over UCP.")]
+
+        # Pre-fill buyer details from the persisted profile if the session has none yet.
+        # This spares the shopper from re-entering info they already saved.
+        if not session.buyer:
+            profile_buyer = self._profile_buyer()
+            if profile_buyer:
+                session.buyer.update(profile_buyer)
+
         # UCP: a checkout can be created from the cart; the store takes the items from it.
         response = await self.call_tool(
             merchant, "create_checkout", {"checkout": {"cart_id": session.carts[store_id]["id"], "line_items": []}}
@@ -685,14 +771,25 @@ class Shop:
         return [text(f"{merchant.name} checkout cancelled.")]
 
     def checkout_payload(self, session: Session) -> dict:
-        """The whole checkout, as UCP update_checkout expects (it replaces the previous state)."""
+        """The whole checkout, as UCP update_checkout expects (it replaces the previous state).
+
+        Market context is read from the persisted profile. If the shopper has provided
+        a shipping address, its country overrides the profile country for this context,
+        since an authoritative address takes precedence over a preference hint.
+        Signals (IP, User-Agent) are included when available.
+        """
         lines = session.checkout.get("line_items") or []
+        ctx = self._market_context()
+        # A confirmed shipping address country supersedes the profile preference hint.
+        if session.address:
+            ctx["address_country"] = session.address["address_country"]
         payload: dict = {
             "line_items": [{"item": {"id": line["item"]["id"]}, "quantity": line["quantity"]} for line in lines],
-            # The context follows the shipping address once there is one.
-            "context": {**self.cart_context, **({"address_country": session.address["address_country"]}
-                                                if session.address else {})},
         }
+        if ctx:
+            payload["context"] = ctx
+        if session.signals:
+            payload["signals"] = session.signals
         if session.buyer:
             payload["buyer"] = session.buyer
         if session.address and not missing_recipient(session):

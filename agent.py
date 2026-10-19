@@ -56,7 +56,8 @@ How to work:
 - Product cards, the carts and the checkout are shown to the shopper automatically
   next to your reply, so don't repeat them item by item. Reply in one to three
   short sentences, saying what you did and what the shopper can do next.
-- Prices are in the currency shown with them; most stores price in US dollars.
+- Prices are shown in the currency returned by the store. If the shopper asks for
+  a price limit, pass it in the currency they specify or the store's currency.
 - Each store has its own cart and checks out separately. When the shopper has carts at
   several stores, ask which store to check out first.
 - Before removing items, emptying the carts or cancelling the checkout, be sure the
@@ -107,7 +108,9 @@ def build_tools(registry: Registry) -> list[dict]:
              categories={"type": "array", "items": {"type": "string", "enum": registry.categories},
                          "description": f"One to {MAX_CATEGORIES} categories from the store list that match "
                                         "the shopper's request, most relevant first"},
-             min_price_usd=NUMBER_OR_NULL, max_price_usd=NUMBER_OR_NULL),
+             # Named min_price / max_price (not USD-specific) because the buyer's saved
+             # market preferences determine the actual currency sent to the store.
+             min_price=NUMBER_OR_NULL, max_price=NUMBER_OR_NULL),
         tool("show_more_results", "Show the next page of the last search."),
         tool("get_product_details", "Show full details of one product, optionally with an option selected.",
              product_id={"type": "string"},
@@ -140,8 +143,9 @@ def build_tools(registry: Registry) -> list[dict]:
     ]
 
 
-def cents(usd: float | None) -> int | None:
-    return round(usd * 100) if usd is not None else None
+def price_cents(amount: float | None) -> int | None:
+    """Convert a decimal price amount to integer minor units (cents, pence, paise, etc.)."""
+    return round(amount * 100) if amount is not None else None
 
 
 def product_summary(product: dict) -> dict:
@@ -222,8 +226,14 @@ class Agent:
         if self.client:
             logger.info(f"Chat runs on the dentsu AI gateway, deployment {self.model}")
 
-    async def reply(self, message: str, session_id: str | None) -> dict:
+    async def reply(self, message: str, session_id: str | None,
+                    request_signals: dict | None = None) -> dict:
+        """One chat turn. request_signals carries IP/UA from the HTTP layer for UCP forwarding."""
         session = self.shop.session(session_id)
+        # Store the current request's signals on the session so shop methods can include them.
+        # They are never persisted to the profile database.
+        if request_signals:
+            session.signals = request_signals
         if not self.client:
             text, blocks = "", [notice("error", "The assistant isn't configured. Set up the dentsu AI gateway in .env.")]
         else:
@@ -242,9 +252,12 @@ class Agent:
         blocks = ([{"type": "text", "text": text}] if text else []) + blocks
         return self.response(session, blocks)
 
-    async def submit_details(self, session_id: str | None, details: dict) -> dict:
+    async def submit_details(self, session_id: str | None, details: dict,
+                             request_signals: dict | None = None) -> dict:
         """The checkout card's delivery details form: saved straight through the shop, no model call."""
         session = self.shop.session(session_id)
+        if request_signals:
+            session.signals = request_signals
         blocks = await self.shop.update_checkout(session, details)
         # Tell the model on the next message that the form was used.
         session.history += [{"role": "user", "content": "(Submitted the checkout's delivery details form.)"},
@@ -301,8 +314,8 @@ class Agent:
         shop = self.shop
         match name:
             case "search_products":
-                return await shop.search(session, args["query"], args["categories"], cents(args["min_price_usd"]),
-                                         cents(args["max_price_usd"]))
+                return await shop.search(session, args["query"], args["categories"],
+                                         price_cents(args["min_price"]), price_cents(args["max_price"]))
             case "show_more_results":
                 return await shop.more(session)
             case "get_product_details":

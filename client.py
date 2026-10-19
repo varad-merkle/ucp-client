@@ -6,6 +6,8 @@ goes through call_mcp(), which adds meta.ucp-agent (and an idempotency key where
 requires one), logs the call and records it for the frontend's protocol log.
 
     GET  /profile.json                our UCP platform profile
+    GET  /api/profile                 get the persisted buyer profile
+    PATCH /api/profile                update buyer or market preferences
     POST /api/chat                    one chat turn (agent.py + shop.py)
     POST /api/checkout/details        the checkout card's delivery details form
     GET  /api/health                  status of this client and the stores
@@ -50,6 +52,7 @@ from ucp_sdk.models.schemas.shopping.types.line_item_create_request import LineI
 
 from agent import Agent
 from merchants import Merchant, Registry
+from profile_store import get_profile, init_db, update_profile
 from shop import Shop
 
 load_dotenv()
@@ -63,8 +66,7 @@ for noisy in ("pyngrok", "httpx", "httpx2", "mcp"):
 
 PORT = 7000
 PROFILE_PATH = Path(__file__).parent / "profile.json"
-CURRENCY = ""
-COUNTRY = ""  # prices carts in USD, like the catalog
+
 # The store used by the direct /api/mcp/... endpoints when no ?merchant= is given.
 DEFAULT_MERCHANT = "pier1"
 
@@ -101,7 +103,11 @@ MAX_EXCHANGES = 200
 async def lifespan(app: FastAPI):
     global public_url
 
-    # 1. Start the tunnel, so the store can fetch our profile.
+    # 1. Initialize the buyer profile database before any request is served.
+    init_db()
+    logger.info("Buyer profile database ready")
+
+    # 2. Start the tunnel, so the store can fetch our profile.
     try:
         ngrok_tunnel = ngrok.connect(addr=str(PORT))
     except PyngrokNgrokHTTPError as exc:
@@ -112,7 +118,7 @@ async def lifespan(app: FastAPI):
     public_url = ngrok_tunnel.public_url
     logger.info(f"Public profile URL: {public_url}/profile.json")
 
-    # 2. Read each store's /.well-known/ucp for its MCP endpoint, version and capabilities.
+    # 3. Read each store's /.well-known/ucp for its MCP endpoint, version and capabilities.
     await registry.discover_all(read_profile())
     available = [m.name for m in registry.all() if not m.error]
     logger.info(f"{len(available)} of {len(registry.all())} stores available: {', '.join(available)}")
@@ -254,7 +260,7 @@ def check_ucp_status(response: dict, action: str) -> dict:
     raise HTTPException(status_code=status, detail=detail)
 
 
-shop = Shop(registry, call_mcp, CURRENCY, COUNTRY)
+shop = Shop(registry, call_mcp)
 agent = Agent(shop)
 
 
@@ -276,16 +282,88 @@ async def get_agent_profile(request: Request):
     return JSONResponse(profile, headers=headers)
 
 
+# ------------------------------------------------------------ buyer profile
+
+
+class BuyerUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    first_name: str | None = None
+    last_name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+
+
+class MarketUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    country: str | None = None
+    preferred_currency: str | None = None
+    language: str | None = None
+    region: str | None = None
+    postal_code: str | None = None
+
+
+class ProfilePatch(BaseModel):
+    model_config = {"extra": "forbid"}
+    buyer: BuyerUpdate | None = None
+    market: MarketUpdate | None = None
+
+
+@app.get("/api/profile")
+async def read_buyer_profile():
+    """Return the persisted buyer profile (buyer info + market preferences)."""
+    return get_profile()
+
+
+@app.patch("/api/profile")
+async def patch_buyer_profile(body: ProfilePatch):
+    """Partially update the buyer profile.
+
+    Only explicitly provided fields are changed. An explicit null clears a field.
+    Fields absent from the request body are preserved unchanged.
+    """
+    buyer = body.buyer.model_dump(exclude_unset=True) if body.buyer else {}
+    market = body.market.model_dump(exclude_unset=True) if body.market else {}
+    try:
+        return update_profile(buyer, market)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+# ------------------------------------------------------------ chat
+
+
+def _extract_signals(request: Request) -> dict:
+    """Build a UCP signals dict from the HTTP request.
+
+    Uses the direct client address (request.client.host) rather than X-Forwarded-For
+    to avoid blindly trusting proxy headers without a configured trust relationship.
+    These signals are forwarded to the store in UCP requests; they are not stored in
+    the buyer profile database.
+
+    Supported by the official UCP SignalsCreateRequest schema:
+      - dev.ucp.buyer_ip
+      - dev.ucp.user_agent
+    """
+    signals: dict = {}
+    if request.client and request.client.host:
+        signals["dev.ucp.buyer_ip"] = request.client.host
+    user_agent = request.headers.get("user-agent")
+    if user_agent:
+        signals["dev.ucp.user_agent"] = user_agent
+    return signals
+
+
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
 
 
 @app.post("/api/chat")
-async def chat_turn(body: ChatRequest):
+async def chat_turn(body: ChatRequest, request: Request):
     """One chat turn: the reply is a list of blocks the frontend renders."""
     logger.info(f"Chat: {body.message!r}")
-    reply = await agent.reply(body.message, body.session_id)
+    signals = _extract_signals(request)
+    reply = await agent.reply(body.message, body.session_id, signals)
     logger.info(f"Reply: {', '.join(block['type'] for block in reply['blocks'])}")
     return reply
 
@@ -308,11 +386,12 @@ class CheckoutDetailsRequest(BaseModel):
 
 
 @app.post("/api/checkout/details")
-async def checkout_details(body: CheckoutDetailsRequest):
+async def checkout_details(body: CheckoutDetailsRequest, request: Request):
     """The checkout card's delivery details form: saved on the checkout in one update."""
     logger.info("Chat: delivery details form submitted")
     details = {k: (v.strip() or None) if isinstance(v, str) else v for k, v in body.details.model_dump().items()}
-    return await agent.submit_details(body.session_id, details)
+    signals = _extract_signals(request)
+    return await agent.submit_details(body.session_id, details, signals)
 
 
 async def probe(merchant: Merchant) -> tuple[int, int]:
@@ -522,16 +601,7 @@ async def update_checkout_mcp(request: MCPUpdateCheckoutRequest, merchant: str =
 # (also uncomment MCPCompleteCheckoutRequest and the CheckoutCompleteRequest import).
 # @app.post("/api/mcp/checkout/complete")
 # async def complete_checkout_mcp(request: MCPCompleteCheckoutRequest, merchant: str = DEFAULT_MERCHANT):
-#     """
-#     Complete a checkout (place the order) via an MCP client.
-#     Expects a valid Checkout ID and payment details.
-#     The UCP spec requires an idempotency key for complete_checkout.
-#     """
-#     checkout = request.checkout.model_dump(mode="json", exclude_none=True)
-#     return check_ucp_status(
-#         await call_store(merchant, "complete_checkout", {"id": request.id, "checkout": checkout}),
-#         "Checkout completion",
-#     )
+#     ...
 
 
 @app.post("/api/mcp/checkout/cancel")
