@@ -17,6 +17,8 @@ dependencies = [
 [tool.sonar]
 projectKey = "UCP_MCP"
 projectName = "UCP Client (backend)"
+# New code is judged from the last version change: bump this to start a new baseline.
+projectVersion = "1.0"
 sources = "."
 exclusions = ".venv/**,__pycache__/**,.scannerwork/**,.ruff_cache/**,.idea/**,.pytest_cache/**,tests/**,test.py,*.db"
 tests = "tests"
