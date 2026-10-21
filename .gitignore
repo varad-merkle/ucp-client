@@ -35,3 +35,10 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+
+.scannerwork/
+# Test and coverage output
+.pytest_cache/
+.coverage
+coverage.xml

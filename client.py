@@ -615,4 +615,5 @@ async def cancel_checkout_mcp(request: CancelCheckoutRequest, merchant: str = DE
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("client:app", host="0.0.0.0", port=PORT)
+    # localhost only: ngrok and the frontend dev server both reach it locally.
+    uvicorn.run("client:app", host="127.0.0.1", port=PORT)
