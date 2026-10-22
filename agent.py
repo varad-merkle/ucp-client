@@ -247,7 +247,9 @@ class Agent:
                     text, blocks = "", [notice("warning", "A store is getting too many requests right now. "
                                                           "Wait a few seconds and try again.")]
                 else:
-                    text, blocks = "", [notice("error", f"A store could not be reached: {exc}")]
+                    # HTTPException keeps its message in `detail`; str() would add the status code.
+                    reason = getattr(exc, "detail", None) or str(exc)
+                    text, blocks = "", [notice("error", f"{reason}. Try again in a moment.")]
 
         blocks = ([{"type": "text", "text": text}] if text else []) + blocks
         return self.response(session, blocks)

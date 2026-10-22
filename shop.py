@@ -258,7 +258,29 @@ def delivery_group(checkout: dict) -> dict:
     return (shipping_method(checkout).get("groups") or [{}])[0]
 
 
-def checkout_block(checkout: dict, given: dict | None = None, store: str | None = None) -> dict:
+def checkout_messages(checkout: dict, address_sent: bool, store: str | None = None) -> list[dict]:
+    """
+    The store's checkout messages worth showing the shopper. Until a delivery address has
+    been sent, the store says both that one is required and that it can't deliver; those
+    only restate that the address is still to come, so they are left out. The store's own
+    "can't be shipped" text tells the shopper to remove items, so it is reworded.
+    """
+    shown = []
+    for m in checkout.get("messages") or []:
+        code = m.get("code") or ""
+        no_delivery = code.startswith("delivery_no_delivery_available")
+        if not address_sent and (no_delivery or code == "delivery_address_required"):
+            continue
+        content = m.get("content", "")
+        if no_delivery:
+            content = f"{store or 'The store'} doesn't deliver these items to that address."
+        shown.append({"type": m.get("type", "info"), "code": m.get("code"), "content": content,
+                      "path": m.get("path"), "severity": m.get("severity")})
+    return shown
+
+
+def checkout_block(checkout: dict, given: dict | None = None, store: str | None = None,
+                   address_sent: bool = True) -> dict:
     """
     A UCP checkout as the frontend's checkout card. `given` holds the buyer and address
     details the shopper entered, to pre-fill the card's delivery details form.
@@ -297,9 +319,7 @@ def checkout_block(checkout: dict, given: dict | None = None, store: str | None 
                 for i in (checkout.get("payment") or {}).get("instruments") or []
             ],
             # path (e.g. "$.buyer.phone_number") and severity let the card point a message at a form field.
-            "messages": [{"type": m.get("type", "info"), "code": m.get("code"), "content": m.get("content", ""),
-                          "path": m.get("path"), "severity": m.get("severity")}
-                         for m in checkout.get("messages") or []],
+            "messages": checkout_messages(checkout, address_sent, store),
             "links": checkout.get("links") or [],
             "details": {
                 "email": given.get("email", ""),
@@ -821,16 +841,16 @@ class Shop:
         session.checkout = response
         # UCP: "recoverable" errors are fixed with update_checkout. Anything needing the buyer on the
         # store's own page (requires_buyer_input / review) would go to continue_url, which is switched off.
-        needed = [m.get("content", "") for m in response.get("messages") or []
-                  if m.get("type") == "error" and m.get("severity") == "recoverable"
-                  # Before any address is given the store also says it can't deliver; skip that.
-                  and not (m.get("code") == "delivery_no_delivery_available" and not session.address)
-                  # We have the address but hold it until the recipient is complete (see checkout_payload).
-                  and not (m.get("code") == "delivery_address_required" and session.address)]
-        if session.address:
+        # The address is held back until the recipient is complete (see checkout_payload).
+        address_sent = bool(session.address) and not missing_recipient(session)
+        messages = checkout_messages(response, address_sent, merchant.name)
+        needed = [m["content"] for m in messages if m["type"] == "error" and m["severity"] == "recoverable"]
+        if not session.address:
+            needed.append("Shipping address")
+        else:
             needed += [f"Recipient {name.replace('_', ' ')}" for name in missing_recipient(session)]
 
-        blocks = [checkout_block(response, {**session.buyer, **session.address}, merchant.name)]
+        blocks = [checkout_block(response, {**session.buyer, **session.address}, merchant.name, address_sent)]
         if needed:
             blocks.append(text(f"{merchant.name} still needs: " + "; ".join(needed)))
         else:

@@ -88,6 +88,11 @@ TOOL_CAPABILITIES = {
 # The UCP spec requires meta.idempotency-key for these tools.
 IDEMPOTENT_TOOLS = {"cancel_cart", "complete_checkout", "cancel_checkout"}
 
+# Stores now and then fail a call with a passing "Internal error"; the same call
+# usually works a moment later, so it is tried once more before giving up.
+RETRY_ERRORS = {"internal error"}
+RETRY_DELAY = 1.0  # seconds
+
 # Set on startup: our public URL (ngrok).
 public_url: str | None = None
 
@@ -202,26 +207,31 @@ async def call_mcp(merchant: Merchant, tool: str, arguments: dict) -> dict:
         meta["idempotency-key"] = str(uuid.uuid4())
     arguments = {"meta": meta, **arguments}
 
-    logger.info(f"  -> {merchant.id}.{tool} {json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
-    started = time.perf_counter()
-    try:
-        async with Client(merchant.endpoint) as mcp_client:
-            result = await mcp_client.call_tool(tool, arguments)
-        text = next((block.text for block in result.content if isinstance(block, TextContent)), "")
-        # UCP returns its response in structuredContent; the text block is the same data as JSON.
+    for attempt in (1, 2):
+        logger.info(f"  -> {merchant.id}.{tool} {json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
+        started = time.perf_counter()
         try:
-            response = result.structured_content or json.loads(text)
-        except json.JSONDecodeError:
-            response = None
-        # Business outcomes (e.g. cart not found) still come back as a UCP response,
-        # even when the tool call is flagged as an error. Anything else is a real failure.
-        if not isinstance(response, dict) or (result.is_error and "ucp" not in response):
-            raise RuntimeError(text or "the store returned a tool error")
-    except Exception as exc:
-        message = error_message(exc)
-        logger.error(f"  <- {merchant.id}.{tool} failed: {message}")
-        log_exchange(merchant, tool, arguments, started, 502, error=message)
-        raise HTTPException(status_code=502, detail=f"{merchant.name} {tool} failed: {message}")
+            async with Client(merchant.endpoint) as mcp_client:
+                result = await mcp_client.call_tool(tool, arguments)
+            text = next((block.text for block in result.content if isinstance(block, TextContent)), "")
+            # UCP returns its response in structuredContent; the text block is the same data as JSON.
+            try:
+                response = result.structured_content or json.loads(text)
+            except json.JSONDecodeError:
+                response = None
+            # Business outcomes (e.g. cart not found) still come back as a UCP response,
+            # even when the tool call is flagged as an error. Anything else is a real failure.
+            if not isinstance(response, dict) or (result.is_error and "ucp" not in response):
+                raise RuntimeError(text or "the store returned a tool error")
+            break
+        except Exception as exc:
+            message = error_message(exc)
+            logger.error(f"  <- {merchant.id}.{tool} failed: {message}")
+            log_exchange(merchant, tool, arguments, started, 502, error=message)
+            if attempt == 1 and message.strip().lower() in RETRY_ERRORS:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            raise HTTPException(status_code=502, detail=f"{merchant.name} {tool} failed: {message}")
     log_exchange(merchant, tool, arguments, started, 200, response)
     elapsed = round((time.perf_counter() - started) * 1000)
     outcome = "returned an error" if response.get("ucp", {}).get("status") == "error" else "OK"
