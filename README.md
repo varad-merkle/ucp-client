@@ -6,6 +6,9 @@ The project has been developed using the UCP SDK classes and is built to be full
 
 <hr/>
 
+<h2>Architecture</h2>
+<img src="public/ucp-client-architecture.jpg" alt="UCP client system architecture" width="100%">
+
 <h2>Project Structure</h2>
 <code>client.py</code> - Main driver of the application. It serves as the entry point for the FastAPI app and handles the
 following important tasks:
@@ -36,3 +39,16 @@ merchant object and adds them all to the registry of merchants with details like
 <code>profile_store.py</code> - Adds state for the buyer profile to record signals such as the market the user is shopping
 in to personalize the data presented to the user. It uses SQLite to power the mechanism offering a simple interface to update 
 the sole user profile.
+
+<hr/>
+
+<h3>Cart and checkout</h3>
+After adding support for multiple merchants, each merchant maintains its own state.
+Therefore, instead of maintaining a single, global cart across merchants, there are as many carts as there are merchants.
+And it follows that, checkout will have to be executed per merchant, one at a time.
+
+<h3>Personalization</h3>
+In order to provide a better user experience, user signals like the country of residence and desired currency codes are
+recorded, persisted and eventually passed on to the merchant as context & buyer signals.
+When a merchant supports a particular geography or currency, the data will flow in the desired currency. Otherwise, the
+default merchant output is relayed back to the user.

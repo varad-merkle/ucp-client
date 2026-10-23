@@ -25,6 +25,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -59,6 +60,8 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ucp-client")
+
+ngrok.set_auth_token(os.getenv("NGROK_AUTH_TOKEN"))
 
 # Keep the terminal readable: hide the libraries' own request-by-request logs.
 for noisy in ("pyngrok", "httpx", "httpx2", "mcp"):
