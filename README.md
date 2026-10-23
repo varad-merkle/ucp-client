@@ -7,7 +7,7 @@ The project has been developed using the UCP SDK classes and is built to be full
 <hr/>
 
 <h2>Architecture</h2>
-<img src="public/ucp-client-architecture.jpg" alt="UCP client system architecture" width="100%">
+<img src="public/ucp-client-architecture-multi-merchant.svg" alt="UCP client system architecture with multi-merchant support and SQLite buyer profile" width="100%">
 
 <h2>Project Structure</h2>
 <code>client.py</code> - Main driver of the application. It serves as the entry point for the FastAPI app and handles the
@@ -39,6 +39,18 @@ merchant object and adds them all to the registry of merchants with details like
 <code>profile_store.py</code> - Adds state for the buyer profile to record signals such as the market the user is shopping
 in to personalize the data presented to the user. It uses SQLite to power the mechanism offering a simple interface to update 
 the sole user profile.
+
+<h3> Application Lifecycle </h3>
+<p>
+The diagram below shows how a request travels to a merchant and back, and how a checkout moves through its states.
+The top row is the pattern every store call follows through <code>call_mcp</code>: pick the store, add the buyer context
+from the profile, wrap the arguments in the <code>meta</code> envelope (with an idempotency key where UCP requires one),
+call that store's MCP endpoint, then parse, log and return the response.
+The middle row shows the checkout flow, run one store at a time, next to the UCP checkout status lifecycle and where this
+client stops; the bottom row shows the arguments sent on every call and maps each <code>/api/mcp/*</code> endpoint to its MCP tool.
+Payment (<code>complete_checkout</code>) is shown for completeness but is switched off in this client.
+</p>
+<img src="public/ucp-client-request-flow-lifecycle.svg" alt="Request pattern, checkout flow and checkout status lifecycle" width="100%" />
 
 <hr/>
 
