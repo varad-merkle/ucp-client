@@ -36,6 +36,7 @@ logger = logging.getLogger("ucp-client")
 PAGE_SIZE = 8  # products per page from a single store
 MIN_PER_STORE = 4  # products per page from each store when several are searched
 MAX_CATEGORIES = 3
+MAX_SEARCHES = 3  # different things asked for in one message, each shown in its own column
 MAX_SESSIONS = 500
 EMPTY_STATE = {"cart_count": 0, "cart_subtotal": 0, "checkout_id": None}
 
@@ -59,11 +60,20 @@ Blocks = list[dict]
 
 
 @dataclass
+class Search:
+    """One thing the shopper asked for, searched at the stores selling its categories."""
+    label: str  # shown above this search's column of results
+    request: dict  # without pagination
+    stores: list[Merchant]
+    why: str  # which stores were searched and why, for the model
+    next_cursors: dict[str, str] = field(default_factory=dict)  # merchant id -> next page cursor
+
+
+@dataclass
 class Session:
     id: str
     products: list[dict] = field(default_factory=list)  # last products shown, in display order, tagged with STORE_KEY
-    last_search: dict | None = None  # the request, without pagination
-    next_cursors: dict[str, str] = field(default_factory=dict)  # merchant id -> next page cursor
+    searches: list[Search] = field(default_factory=list)  # the searches behind the products shown
     detail: dict | None = None  # last product shown in detail
     carts: dict[str, dict] = field(default_factory=dict)  # merchant id -> that store's last cart response
     checkout: dict | None = None  # the open checkout's last response
@@ -77,6 +87,9 @@ class Session:
     # IP address and User-Agent from the most recent HTTP request for this session.
     # These are forwarded in the UCP `signals` field; never stored in the profile DB.
     signals: dict = field(default_factory=dict)
+
+    def has_more(self) -> bool:
+        return any(search.next_cursors for search in self.searches)
 
 
 # ------------------------------------------------------------------ blocks
@@ -468,26 +481,49 @@ class Shop:
             return searchable, f"No available store sells {', '.join(wanted)}, so every store was searched.{note}"
         return chosen, f"Searched {', '.join(m.name for m in chosen)} for {', '.join(wanted)}.{note}"
 
-    async def search(self, session: Session, query: str | None, categories: list[str] | None,
-                     low: int | None, high: int | None) -> Blocks:
-        stores, why = self.stores_for(categories)
-        logger.info(f"Categories {categories} -> {[m.id for m in stores]}: {why}")
+    async def search(self, session: Session, searches: list[dict]) -> Blocks:
+        """
+        Run one to MAX_SEARCHES searches together, each {query, categories, low, high}.
+        Several searches (e.g. shoes and a dining table) are shown side by side.
+        """
         ctx = self._market_context()
-        request: dict = {}
-        if ctx:
-            request["context"] = ctx
-        if query:
-            request["query"] = query
-        if low is not None or high is not None:
-            request["filters"] = {"price": {k: v for k, v in (("min", low), ("max", high)) if v is not None}}
-        session.last_search = request
-        session.next_cursors = {}
-        limit = PAGE_SIZE if len(stores) == 1 else MIN_PER_STORE
-        results = await asyncio.gather(
-            *(self.search_store(m, request, limit, signals=session.signals or None) for m in stores),
-            return_exceptions=True,
-        )
-        return self.show_results(session, request, list(zip(stores, results)), why)
+        session.searches = []
+        for wanted in searches[:MAX_SEARCHES]:
+            stores, why = self.stores_for(wanted["categories"])
+            logger.info(f"Categories {wanted['categories']} -> {[m.id for m in stores]}: {why}")
+            request: dict = {}
+            if ctx:
+                request["context"] = ctx
+            if wanted["query"]:
+                request["query"] = wanted["query"]
+            low, high = wanted["low"], wanted["high"]
+            if low is not None or high is not None:
+                request["filters"] = {"price": {k: v for k, v in (("min", low), ("max", high)) if v is not None}}
+            label = wanted["query"] or ", ".join(wanted["categories"] or []) or "Results"
+            session.searches.append(Search(label, request, stores, why))
+        return await self.run_searches(session, session.searches)
+
+    async def more(self, session: Session) -> Blocks:
+        if not session.has_more():
+            return [text("There are no more results for the last search.")]
+        searches = [s for s in session.searches if s.next_cursors]
+        cursors = [s.next_cursors for s in searches]
+        for search in searches:
+            search.stores = [self.registry.get(store_id) for store_id in search.next_cursors]
+            search.why = f"Next page from {', '.join(m.name for m in search.stores)}."
+            search.next_cursors = {}
+        return await self.run_searches(session, searches, cursors)
+
+    async def run_searches(self, session: Session, searches: list[Search], cursors: list[dict[str, str]] | None = None) -> Blocks:
+        """Send every search to its stores at once, then show the results."""
+        calls = []
+        for i, search in enumerate(searches):
+            limit = PAGE_SIZE if len(search.stores) == 1 else MIN_PER_STORE
+            for m in search.stores:
+                cursor = cursors[i].get(m.id) if cursors else None
+                calls.append(self.search_store(m, search.request, limit, cursor, signals=session.signals or None))
+        results = iter(await asyncio.gather(*calls, return_exceptions=True))
+        return self.show_results(session, [(s, [(m, next(results)) for m in s.stores]) for s in searches])
 
     async def search_store(self, merchant: Merchant, request: dict, limit: int,
                            cursor: str | None = None, signals: dict | None = None) -> dict:
@@ -502,26 +538,12 @@ class Shop:
             response = await self.call_tool(merchant, "search_catalog", {"catalog": catalog_retry})
         return response
 
-    async def more(self, session: Session) -> Blocks:
-        if not session.last_search or not session.next_cursors:
-            return [text("There are no more results for the last search.")]
-        stores = [self.registry.get(store_id) for store_id in session.next_cursors]
-        cursors = dict(session.next_cursors)
-        session.next_cursors = {}
-        limit = PAGE_SIZE if len(stores) == 1 else MIN_PER_STORE
-        results = await asyncio.gather(
-            *(self.search_store(m, session.last_search, limit, cursors[m.id],
-                                signals=session.signals or None) for m in stores),
-            return_exceptions=True,
-        )
-        return self.show_results(session, session.last_search, list(zip(stores, results)),
-                                 f"Next page from {', '.join(m.name for m in stores)}.")
-
-    def show_results(self, session: Session, request: dict, results: list[tuple[Merchant, dict | BaseException]],
-                     why: str) -> Blocks:
-        price = (request.get("filters") or {}).get("price")
+    def search_results(self, search: Search, results: list[tuple[Merchant, dict | BaseException]]
+                       ) -> tuple[list[dict], str, Blocks]:
+        """One search's products, a summary for the model, and the stores' notices."""
+        price = (search.request.get("filters") or {}).get("price")
         # Use the currency from the request context for price comparison (not a hardcoded default).
-        currency = (request.get("context") or {}).get("currency")
+        currency = (search.request.get("context") or {}).get("currency")
         products, counts, problems = [], [], []
         for merchant, response in results:
             if isinstance(response, BaseException):
@@ -534,15 +556,35 @@ class Shop:
             counts.append(f"{merchant.name} {len(found)}")
             pagination = response.get("pagination") or {}
             if pagination.get("has_next_page") and pagination.get("cursor"):
-                session.next_cursors[merchant.id] = pagination["cursor"]
+                search.next_cursors[merchant.id] = pagination["cursor"]
             problems += notices(response.get("messages"))
+        return products, f"{search.why} Results per store: {', '.join(counts) or 'none'}.", problems
 
-        summary = f"{why} Results per store: {', '.join(counts) or 'none'}."
+    def show_results(self, session: Session,
+                     searches: list[tuple[Search, list[tuple[Merchant, dict | BaseException]]]]) -> Blocks:
+        groups, summaries, problems = [], [], []
+        for search, results in searches:
+            found, summary, found_problems = self.search_results(search, results)
+            groups.append((search, found))
+            label = f'"{search.label}": {len(found)} products. ' if len(searches) > 1 else ""
+            summaries.append(label + summary)
+            problems += found_problems
+
+        products = [p for _, found in groups for p in found]
+        summary = " ".join(summaries)
         if not products:
-            more = " More pages are available." if session.next_cursors else ""
+            more = " More pages are available." if session.has_more() else ""
             return [text(f"No products matched. {summary}{more}"), *problems]
         session.products = products
-        cards = {"type": "products", "products": [product_card(p, self.store_of(p).name) for p in products]}
+        cards: dict = {"type": "products", "products": [product_card(p, self.store_of(p).name) for p in products]}
+        if len(groups) > 1:
+            # Different things asked for at once: the frontend shows each in its own column.
+            cards["groups"] = [
+                {"title": search.label,
+                 "stores": [m.name for m in search.stores],
+                 "products": [product_card(p, self.store_of(p).name) for p in found]}
+                for search, found in groups
+            ]
         return [text(f"Found {len(products)} products. {summary}"), cards, *problems]
 
     async def detail(self, session: Session, product_id: str, option_label: str | None = None) -> Blocks:

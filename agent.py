@@ -23,7 +23,7 @@ import os
 from openai import AsyncAzureOpenAI, OpenAIError
 
 from merchants import Registry
-from shop import (MAX_CATEGORIES, STORE_KEY, Blocks, Session, Shop, cart_count, cart_state, delivery_group,
+from shop import (MAX_CATEGORIES, MAX_SEARCHES, STORE_KEY, Blocks, Session, Shop, cart_count, cart_state, delivery_group,
                   dollars, money, notice, total_of)
 
 logger = logging.getLogger("ucp-client")
@@ -47,6 +47,10 @@ Choosing stores:
   what the shopper wants, most relevant first. Map the shopper's words onto the listed
   categories (for example a "loveseat" is "sofas" and "furniture"). Only the stores
   selling those categories are searched. Pass an empty list only when nothing fits.
+- When the shopper asks for different kinds of products in one message (for example
+  shoes and a dining table), make one search_products call with a separate search for
+  each kind, up to {max_searches}, each with its own query and categories. They are shown
+  side by side. Never mix different kinds of products into one query.
 - Say which store a product comes from when it matters.
 
 How to work:
@@ -102,15 +106,24 @@ def build_tools(registry: Registry) -> list[dict]:
     """The model's tools. Categories and stores can only be values from the registry."""
     store_or_null = {"type": ["string", "null"], "enum": [m.id for m in registry.all()] + [None]}
     return [
-        tool("search_products", "Search the stores that sell the given categories. Use plain product words "
-                                "for the query.",
-             query={**TEXT_OR_NULL, "description": "What to look for, e.g. 'floor lamp'"},
-             categories={"type": "array", "items": {"type": "string", "enum": registry.categories},
-                         "description": f"One to {MAX_CATEGORIES} categories from the store list that match "
-                                        "the shopper's request, most relevant first"},
-             # Named min_price / max_price (not USD-specific) because the buyer's saved
-             # market preferences determine the actual currency sent to the store.
-             min_price=NUMBER_OR_NULL, max_price=NUMBER_OR_NULL),
+        tool("search_products", "Search the stores that sell the given categories. One search per kind of "
+                                "product the shopper asked for; use plain product words for each query.",
+             searches={"type": "array", "description": f"One to {MAX_SEARCHES} searches, one per kind of product",
+                       "items": {
+                           "type": "object",
+                           "properties": {
+                               "query": {**TEXT_OR_NULL, "description": "What to look for, e.g. 'floor lamp'"},
+                               "categories": {"type": "array", "items": {"type": "string", "enum": registry.categories},
+                                              "description": f"One to {MAX_CATEGORIES} categories from the store "
+                                                             "list that match this search, most relevant first"},
+                               # Named min_price / max_price (not USD-specific) because the buyer's saved
+                               # market preferences determine the actual currency sent to the store.
+                               "min_price": NUMBER_OR_NULL,
+                               "max_price": NUMBER_OR_NULL,
+                           },
+                           "required": ["query", "categories", "min_price", "max_price"],
+                           "additionalProperties": False,
+                       }}),
         tool("show_more_results", "Show the next page of the last search."),
         tool("get_product_details", "Show full details of one product, optionally with an option selected.",
              product_id={"type": "string"},
@@ -175,7 +188,7 @@ def state_summary(session: Session) -> dict:
                               "quantity": line["quantity"]} for line in cart.get("line_items") or []],
                    "subtotal": dollars(total_of(cart.get("totals"), "subtotal"))}
                   for store_id, cart in session.carts.items()],
-        "more_results": bool(session.next_cursors),
+        "more_results": session.has_more(),
         "checkout": None,
     }
     if session.checkout:
@@ -276,7 +289,7 @@ class Agent:
             + (" [unavailable right now]" if m.error else "")
             for m in self.shop.registry.all()
         )
-        return INSTRUCTIONS.format(stores=stores, max_categories=MAX_CATEGORIES)
+        return INSTRUCTIONS.format(stores=stores, max_categories=MAX_CATEGORIES, max_searches=MAX_SEARCHES)
 
     async def run(self, message: str, session: Session) -> tuple[str, Blocks]:
         """One shopper message: let the model call tools until it has a reply."""
@@ -316,8 +329,11 @@ class Agent:
         shop = self.shop
         match name:
             case "search_products":
-                return await shop.search(session, args["query"], args["categories"],
-                                         price_cents(args["min_price"]), price_cents(args["max_price"]))
+                return await shop.search(session, [
+                    {"query": s["query"], "categories": s["categories"],
+                     "low": price_cents(s["min_price"]), "high": price_cents(s["max_price"])}
+                    for s in args["searches"]
+                ])
             case "show_more_results":
                 return await shop.more(session)
             case "get_product_details":
@@ -350,5 +366,5 @@ class Agent:
             return ["Show my checkout", "Cancel checkout"]
         options = ["What's in my cart?"] if any(cart_count(cart) for cart in session.carts.values()) else []
         if session.products:
-            options = ["Tell me about the first one"] + (["Show more"] if session.next_cursors else []) + options
+            options = ["Tell me about the first one"] + (["Show more"] if session.has_more() else []) + options
         return options or ["A sofa for my living room", "Car cleaning products", "Which stores can you shop at?"]
