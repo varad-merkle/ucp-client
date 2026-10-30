@@ -4,6 +4,7 @@
       "id": "pier1",
       "name": "Pier 1",
       "url": "https://www.pier1.com",
+      "logo": "/logos/pier1.jpg",
       "categories": [
         "home decoration",
         "rugs",
@@ -22,6 +23,7 @@
       "id": "allbirds",
       "name": "Allbirds",
       "url": "https://www.allbirds.com",
+      "logo": "/logos/allbirds.png",
       "categories": [
         "shoes",
         "footwear",
@@ -34,6 +36,7 @@
       "id": "autoxpert",
       "name": "Auto-Xpert",
       "url": "https://auto-xpert.co.uk",
+      "logo": "/logos/autoxpert.jpg",
       "categories": [
         "car care",
         "car cleaning",
@@ -48,6 +51,7 @@
       "id": "furniturecity",
       "name": "Furniture City",
       "url": "https://furniturecity.com",
+      "logo": "/logos/furniturecity.png",
       "categories": [
         "furniture",
         "sofas",

@@ -34,6 +34,7 @@ class Merchant:
     name: str
     url: str
     categories: list[str]
+    logo: str | None = None
     version: str | None = None
     endpoint: str | None = None
     capabilities: set[str] = field(default_factory=set)
@@ -82,7 +83,8 @@ class Registry:
         data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
         self.merchants = {
             m["id"]: Merchant(id=m["id"], name=m["name"], url=m["url"].rstrip("/"),
-                              categories=[c.strip().lower() for c in m["categories"]])
+                              categories=[c.strip().lower() for c in m["categories"]],
+                              logo=m.get("logo"))
             for m in data["merchants"]
         }
         self.categories = sorted({c for m in self.merchants.values() for c in m.categories})

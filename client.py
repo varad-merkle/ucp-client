@@ -3,16 +3,17 @@
 On startup it opens an ngrok tunnel so the stores can fetch our UCP profile, then reads
 each store's /.well-known/ucp to find its MCP endpoint (merchants.py). Every store call
 goes through call_mcp(), which adds meta.ucp-agent (and an idempotency key where UCP
-requires one), logs the call and records it for the frontend's protocol log.
+requires one), logs the call and records it in the exchange log.
 
     GET  /profile.json                our UCP platform profile
     GET  /api/profile                 get the persisted buyer profile
     PATCH /api/profile                update buyer or market preferences
     POST /api/chat                    one chat turn (agent.py + shop.py)
     POST /api/checkout/details        the checkout card's delivery details form
+    POST /api/checkout/start          a cart card's Checkout button, for one store
     GET  /api/health                  status of this client and the stores
     GET  /api/merchants               the stores, their categories and what discovery found
-    GET  /api/exchanges               recent store calls (protocol log)
+    GET  /api/exchanges               recent store calls (exchange log)
     DELETE /api/exchanges
     POST /api/mcp/catalog/...         direct catalog, cart and checkout calls to one store,
     POST /api/mcp/cart/...            chosen with ?merchant=<id> (default pier1)
@@ -99,7 +100,7 @@ public_url: str | None = None
 # The stores, from merchants.json; discovered on startup.
 registry = Registry()
 
-# Recent calls to the stores, newest first, for the frontend's protocol log.
+# Recent calls to the stores, newest first, served by /api/exchanges.
 exchanges: list[dict] = []
 MAX_EXCHANGES = 200
 
@@ -404,6 +405,22 @@ async def checkout_details(body: CheckoutDetailsRequest, request: Request):
     return await agent.submit_details(body.session_id, details, signals)
 
 
+class StartCheckoutRequest(BaseModel):
+    session_id: str
+    store: str
+
+
+@app.post("/api/checkout/start")
+async def start_checkout(body: StartCheckoutRequest, request: Request):
+    """A cart card's Checkout button: opens the checkout for that card's store."""
+    if not registry.get(body.store):
+        raise HTTPException(status_code=404, detail=f"Unknown store {body.store}")
+    logger.info(f"Chat: checkout button pressed for {body.store}")
+    reply = await agent.start_checkout(body.session_id, body.store, _extract_signals(request))
+    logger.info(f"Reply: {', '.join(block['type'] for block in reply['blocks'])}")
+    return reply
+
+
 async def probe(merchant: Merchant) -> tuple[int, int]:
     """A store's /.well-known/ucp status code and latency in ms (status 0 if unreachable)."""
     started = time.perf_counter()
@@ -434,6 +451,18 @@ async def health():
             "latency_ms": max(latency for _, latency in probes),
             "name": f"{len(online)} of {len(merchants)} stores online",
         },
+        # One row per store for the sidebar; the first listed category is the main one.
+        "stores": [
+            {
+                "id": m.id,
+                "name": m.name,
+                "url": m.url,
+                "logo": m.logo,
+                "category": m.categories[0] if m.categories else None,
+                "online": status == 200 and not m.error,
+            }
+            for m, (status, _) in zip(merchants, probes)
+        ],
     }
 
 
