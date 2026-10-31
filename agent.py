@@ -3,7 +3,7 @@
 The model understands the shopper and writes the replies. It acts through tools,
 and every tool is one of shop.py's actions, so the UCP side stays in plain code:
 discovery, meta.ucp-agent, full-replacement updates, idempotency keys and the
-protocol log. The model never builds a UCP request.
+exchange log. The model never builds a UCP request.
 
 Several stores: the model picks one to three categories from the registry's list
 (merchants.json) for each search, and shop.py sends the search to the stores that sell
@@ -52,6 +52,8 @@ Choosing stores:
   each kind, up to {max_searches}, each with its own query and categories. They are shown
   side by side. Never mix different kinds of products into one query.
 - Say which store a product comes from when it matters.
+- Keep replies about shopping. Never mention UCP capabilities, protocol versions,
+  endpoints or other technical details unless the shopper asks for them.
 
 How to work:
 - Use the tools for every fact about products, prices, stock, the carts and checkout.
@@ -128,7 +130,10 @@ def build_tools(registry: Registry) -> list[dict]:
         tool("get_product_details", "Show full details of one product, optionally with an option selected.",
              product_id={"type": "string"},
              option_label={**TEXT_OR_NULL, "description": "An option value such as a colour or size"}),
-        tool("store_capabilities", "Show which UCP capabilities and categories a store supports.",
+        tool("store_capabilities",
+             "Check what a store sells and supports (for example cart or checkout). For your own "
+             "use only; nothing is shown to the shopper. Call it only when you need it to answer "
+             "a question about a store, never alongside a product search.",
              store={**store_or_null, "description": "A store id; null for every store"}),
         tool("add_to_cart", "Add a product to its store's cart.",
              product_id={"type": "string"},
@@ -277,6 +282,19 @@ class Agent:
         # Tell the model on the next message that the form was used.
         session.history += [{"role": "user", "content": "(Submitted the checkout's delivery details form.)"},
                             {"role": "assistant", "content": "Saved the delivery details on the checkout."}]
+        return self.response(session, blocks)
+
+    async def start_checkout(self, session_id: str | None, store_id: str,
+                             request_signals: dict | None = None) -> dict:
+        """A cart card's Checkout button: opens that store's checkout directly, no model call."""
+        session = self.shop.session(session_id)
+        if request_signals:
+            session.signals = request_signals
+        blocks = await self.shop.start_checkout(session, store_id)
+        name = self.shop.registry.get(store_id).name
+        # Tell the model on the next message which checkout was opened.
+        session.history += [{"role": "user", "content": f"(Pressed Checkout on the {name} cart.)"},
+                            {"role": "assistant", "content": f"Opened the {name} checkout."}]
         return self.response(session, blocks)
 
     def response(self, session: Session, blocks: Blocks) -> dict:

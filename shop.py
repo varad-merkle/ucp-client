@@ -43,15 +43,6 @@ EMPTY_STATE = {"cart_count": 0, "cart_subtotal": 0, "checkout_id": None}
 # The store needs these with a shipping address before it can offer delivery.
 RECIPIENT_FIELDS = ("first_name", "last_name", "phone_number")
 
-# Hidden from the capabilities card for now. Empty this set to show them again.
-HIDDEN_CAPABILITIES = {
-    "dev.ucp.shopping.checkout",
-    "dev.ucp.shopping.discount",
-    "dev.ucp.shopping.fulfillment",
-    "dev.ucp.shopping.order",
-    "dev.ucp.common.identity_linking",
-}
-
 # Products returned by a store are tagged with its merchant id under this key.
 STORE_KEY = "_merchant"
 
@@ -202,24 +193,13 @@ def product_detail(product: dict, store: str | None = None) -> dict:
     return {"type": "product", "product": detail}
 
 
-def capabilities_block(merchant: Merchant, profile: dict) -> dict:
+def capabilities_summary(merchant: Merchant, profile: dict) -> str:
+    """What a store supports, in plain words for the model. Nothing here is shown to the shopper."""
     ucp = profile.get("ucp") or {}
-    return {
-        "type": "capabilities",
-        "version": ucp.get("version"),
-        "business": {"name": merchant.name, "categories": merchant.categories},
-        "capabilities": [
-            {"name": name, "version": entries[0].get("version"), "spec": entries[0].get("spec")}
-            for name, entries in sorted((ucp.get("capabilities") or {}).items())
-            if entries and name not in HIDDEN_CAPABILITIES
-        ],
-        # Payment handlers are hidden for now; uncomment to show them again.
-        "payment_handlers": [
-            # {"name": name, "id": entries[0].get("id", name), "version": entries[0].get("version")}
-            # for name, entries in sorted((ucp.get("payment_handlers") or {}).items())
-            # if entries
-        ],
-    }
+    names = sorted(name for name, entries in (ucp.get("capabilities") or {}).items() if entries)
+    logger.info(f"{merchant.name} capabilities (UCP {ucp.get('version')}): {', '.join(names)}")
+    return (f"{merchant.name} sells {', '.join(merchant.categories)}. "
+            f"It supports: {', '.join(names) or 'nothing listed'}.")
 
 
 def line_view(line: dict) -> dict:
@@ -236,13 +216,14 @@ def line_view(line: dict) -> dict:
     }
 
 
-def cart_block(cart: dict | None, store: str | None = None) -> dict:
+def cart_block(cart: dict | None, merchant: Merchant | None = None) -> dict:
     """A UCP cart as the frontend's cart card (an empty card when there is no cart)."""
     cart = cart or {}
     # Use the merchant's actual currency; fall back to empty string (not a hardcoded USD).
     return {
         "type": "cart",
-        "store": store,
+        "store": merchant.name if merchant else None,
+        "store_id": merchant.id if merchant else None,
         "currency": cart.get("currency", ""),
         "subtotal": total_of(cart.get("totals"), "subtotal"),
         "lines": [line_view(line) for line in cart.get("line_items") or []],
@@ -462,7 +443,7 @@ class Shop:
             if merchant.error:
                 blocks.append(notice("warning", f"{merchant.name} is unavailable: {merchant.error}"))
             else:
-                blocks.append(capabilities_block(merchant, await merchant.profile()))
+                blocks.append(text(capabilities_summary(merchant, await merchant.profile())))
         return blocks
 
     # ------------------------------------------------------------- catalog
@@ -690,7 +671,7 @@ class Shop:
                 existing = response = None
         if not existing:
             if not items:
-                return [text(f"The {merchant.name} cart is empty."), cart_block(None, merchant.name)]
+                return [text(f"The {merchant.name} cart is empty."), cart_block(None, merchant)]
             response = await self.call_tool(merchant, "create_cart", {"cart": cart})
 
         if is_error(response) or not response.get("id"):
@@ -699,7 +680,7 @@ class Shop:
             session.carts[merchant.id] = response
         else:
             session.carts.pop(merchant.id, None)
-        return [text(message), cart_block(response, merchant.name), *notices(response.get("messages"))]
+        return [text(message), cart_block(response, merchant), *notices(response.get("messages"))]
 
     async def view_cart(self, session: Session) -> Blocks:
         if not session.carts:
@@ -716,7 +697,7 @@ class Shop:
                 blocks += notices(response.get("messages")) or [notice("error", f"{merchant.name} couldn't load the cart.")]
             else:
                 session.carts[store_id] = response
-                blocks += [text(f"{merchant.name} cart:"), cart_block(response, merchant.name),
+                blocks += [text(f"{merchant.name} cart:"), cart_block(response, merchant),
                            *notices(response.get("messages"))]
         return blocks or [text("The cart is empty."), cart_block(None)]
 
