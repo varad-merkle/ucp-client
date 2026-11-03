@@ -1,25 +1,25 @@
-"""PostgreSQL persistence for the buyer profile (single record, id = 1).
+"""PostgreSQL persistence for the buyer profile: one record per logged-in user.
 
 Schema version 1: buyer information and market/language preferences.
-The table is created automatically when init_db() is called at startup.
-Connection settings come from the DB_* variables in .env (see .env.example).
-Timestamps are stored as ISO 8601 UTC strings (ending in 'Z').
+The table is created automatically when init_db() is called at startup, and a
+user's empty profile appears the first time it is read.
 
-This profile is application-wide; it is not isolated by authenticated user.
-For this POC, one shared profile per running instance is intentional.
+Every function takes the username that owns the profile, so one user never sees
+or overwrites another's details. Who that user is comes from auth.py; this module
+only trusts the name it is given.
+
+Timestamps are stored as ISO 8601 UTC strings (ending in 'Z').
 """
 
-import os
+import logging
 import re
-from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterator
 
 import psycopg
-from psycopg.rows import dict_row
 
-# Schema holding the buyer_profile table. Tests point this at a throwaway schema via monkeypatch.
-SCHEMA = "public"
+import db
+
+logger = logging.getLogger("ucp-client")
 
 SCHEMA_VERSION = 1
 
@@ -34,81 +34,67 @@ _COUNTRY_RE = re.compile(r"^[A-Z]{2,3}$")          # ISO 3166-1 alpha-2 or alpha
 _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")            # ISO 4217
 _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")  # BCP 47 subset
 
-_REQUIRED_SETTINGS = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _connection_settings() -> dict:
-    """Read the connection settings from the environment. DB_PORT is optional (default 5432)."""
-    missing = [name for name in _REQUIRED_SETTINGS if not os.environ.get(name)]
-    if missing:
-        raise RuntimeError(f"Missing database settings in .env: {', '.join(missing)}")
-    return {
-        "host": os.environ["DB_HOST"],
-        "port": os.environ.get("DB_PORT") or "5432",
-        "dbname": os.environ["DB_NAME"],
-        "user": os.environ["DB_USER"],
-        "password": os.environ["DB_PASSWORD"],
-    }
+def _drop_shared_table(conn: psycopg.Connection) -> None:
+    """Remove the pre-login table, which held one profile shared by everyone at id = 1.
 
-
-@contextmanager
-def _connect() -> Iterator[psycopg.Connection]:
-    """Open a connection that commits on success, rolls back on error, and is always closed."""
-    conn = psycopg.connect(
-        **_connection_settings(),
-        options=f"-c search_path={SCHEMA}",
-        row_factory=dict_row,
-    )
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
-
-
-def _init_schema(conn: psycopg.Connection) -> None:
-    """Create the table and the single profile row (id = 1) if absent."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS buyer_profile (
-            id                  INTEGER PRIMARY KEY,
-            schema_version      INTEGER NOT NULL DEFAULT 1,
-            first_name          TEXT,
-            last_name           TEXT,
-            email               TEXT,
-            phone               TEXT,
-            country             TEXT,
-            preferred_currency  TEXT,
-            language            TEXT,
-            region              TEXT,
-            postal_code         TEXT,
-            updated_at          TEXT NOT NULL
-        )
-    """)
-    # ON CONFLICT DO NOTHING: leaves existing data intact on restart.
-    conn.execute(
-        "INSERT INTO buyer_profile (id, schema_version, updated_at) VALUES (1, %s, %s) ON CONFLICT (id) DO NOTHING",
-        (SCHEMA_VERSION, _now()),
-    )
+    That single row has no owner, so there is nothing to carry over: each user
+    now starts with an empty profile of their own. Runs once; after the table has
+    been rebuilt with a username column there is nothing left to match.
+    """
+    shared = conn.execute(
+        """SELECT 1 FROM information_schema.columns
+           WHERE table_schema = %s AND table_name = 'buyer_profile' AND column_name = 'id'""",
+        (db.SCHEMA,),
+    ).fetchone()
+    if shared:
+        conn.execute("DROP TABLE buyer_profile")
+        logger.info("Replaced the old shared buyer profile with per-user profiles")
 
 
 def init_db() -> None:
-    """Create the table and seed row on first run.
+    """Create the profile table. Call after auth.init_auth(), which creates app_user.
 
-    Safe to call on every startup: existing data is never overwritten.
+    Safe to call on every startup: existing profiles are never overwritten.
     Future schema changes should add an explicit migration here rather than
     altering this function, so the upgrade path stays visible and deliberate.
     """
-    with _connect() as conn:
-        _init_schema(conn)
+    with db.connect() as conn:
+        _drop_shared_table(conn)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS buyer_profile (
+                username            TEXT PRIMARY KEY REFERENCES app_user(username) ON DELETE CASCADE,
+                schema_version      INTEGER NOT NULL DEFAULT 1,
+                first_name          TEXT,
+                last_name           TEXT,
+                email               TEXT,
+                phone               TEXT,
+                country             TEXT,
+                preferred_currency  TEXT,
+                language            TEXT,
+                region              TEXT,
+                postal_code         TEXT,
+                updated_at          TEXT NOT NULL
+            )
+        """)
+
+
+def _create_if_absent(conn: psycopg.Connection, username: str) -> None:
+    """Give this user an empty profile if they do not have one yet."""
+    conn.execute(
+        """INSERT INTO buyer_profile (username, schema_version, updated_at) VALUES (%s, %s, %s)
+           ON CONFLICT (username) DO NOTHING""",
+        (username, SCHEMA_VERSION, _now()),
+    )
 
 
 def _row_to_dict(r: dict) -> dict:
     return {
-        "id": r["id"],
+        "username": r["username"],
         "schema_version": r["schema_version"],
         "buyer": {
             "first_name": r["first_name"],
@@ -127,10 +113,11 @@ def _row_to_dict(r: dict) -> dict:
     }
 
 
-def get_profile() -> dict:
-    """Return the persisted profile as a structured dict."""
-    with _connect() as conn:
-        row = conn.execute("SELECT * FROM buyer_profile WHERE id = 1").fetchone()
+def get_profile(username: str) -> dict:
+    """Return this user's profile as a structured dict, empty on first use."""
+    with db.connect() as conn:
+        _create_if_absent(conn, username)
+        row = conn.execute("SELECT * FROM buyer_profile WHERE username = %s", (username,)).fetchone()
     return _row_to_dict(row)
 
 
@@ -154,8 +141,8 @@ def _validate(buyer: dict, market: dict) -> list[str]:
     return errors
 
 
-def update_profile(buyer: dict | None = None, market: dict | None = None) -> dict:
-    """Partial update: only fields present in buyer/market are changed.
+def update_profile(username: str, buyer: dict | None = None, market: dict | None = None) -> dict:
+    """Partial update of one user's profile: only fields present in buyer/market change.
 
     Semantics:
     - A key present with a non-None value sets that field.
@@ -163,7 +150,7 @@ def update_profile(buyer: dict | None = None, market: dict | None = None) -> dic
     - A key absent from the dict leaves the stored value unchanged.
 
     Raises ValueError for unknown field names or invalid values.
-    Returns the complete updated profile.
+    Returns the user's complete updated profile.
     """
     buyer = buyer or {}
     market = market or {}
@@ -185,12 +172,13 @@ def update_profile(buyer: dict | None = None, market: dict | None = None) -> dic
 
     columns: dict = {**buyer, **market}
     if not columns:
-        return get_profile()  # nothing to change
+        return get_profile(username)  # nothing to change
 
     columns["updated_at"] = _now()
     set_clause = ", ".join(f"{col} = %s" for col in columns)
-    values = [*columns.values(), 1]  # WHERE id = 1
+    values = [*columns.values(), username]
 
-    with _connect() as conn:
-        conn.execute(f"UPDATE buyer_profile SET {set_clause} WHERE id = %s", values)  # noqa: S608
-    return get_profile()
+    with db.connect() as conn:
+        _create_if_absent(conn, username)
+        conn.execute(f"UPDATE buyer_profile SET {set_clause} WHERE username = %s", values)  # noqa: S608
+    return get_profile(username)

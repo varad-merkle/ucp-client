@@ -12,7 +12,8 @@ open at a time.
 Market context (currency, country, language, region, postal_code) is read from the
 persisted buyer profile (profile_store.py) on each relevant UCP call. Buyer info
 (name, email, phone) is pre-filled from the profile when a checkout starts if the
-session has not yet collected those details.
+session has not yet collected those details. Both are read for the user the session
+belongs to, so each logged-in user shops with their own details.
 
 Request-level signals (IP address, User-Agent) are stored on the session and forwarded
 to UCP calls that accept a `signals` field, per the official schema. They are never
@@ -63,6 +64,7 @@ class Search:
 @dataclass
 class Session:
     id: str
+    username: str  # the logged-in user this session belongs to; profiles are read per user
     products: list[dict] = field(default_factory=list)  # last products shown, in display order, tagged with STORE_KEY
     searches: list[Search] = field(default_factory=list)  # the searches behind the products shown
     detail: dict | None = None  # last product shown in detail
@@ -382,8 +384,8 @@ class Shop:
         self.call_tool = call_tool  # (merchant, tool, tool arguments)
         self.sessions: dict[str, Session] = {}
 
-    def _market_context(self) -> dict:
-        """Build a UCP context dict from the persisted market preferences.
+    def _market_context(self, username: str) -> dict:
+        """Build a UCP context dict from this user's persisted market preferences.
 
         Only non-None profile values are included. The fields map to the official
         UCP ContextCreateRequest schema (context_create_request.py in the SDK).
@@ -391,7 +393,7 @@ class Shop:
         address_region, postal_code.
         """
         from profile_store import get_profile  # local import avoids circular deps at module load
-        market = get_profile()["market"]
+        market = get_profile(username)["market"]
         ctx: dict = {}
         if market.get("preferred_currency"):
             ctx["currency"] = market["preferred_currency"]
@@ -405,14 +407,14 @@ class Shop:
             ctx["postal_code"] = market["postal_code"]
         return ctx
 
-    def _profile_buyer(self) -> dict:
-        """Buyer fields from the persisted profile, mapped to UCP checkout buyer keys.
+    def _profile_buyer(self, username: str) -> dict:
+        """Buyer fields from this user's profile, mapped to UCP checkout buyer keys.
 
         phone_number is the UCP field name (BuyerCreateRequest); the profile stores it
         as 'phone'. Used only for pre-filling a new checkout session, not for catalog.
         """
         from profile_store import get_profile
-        buyer = get_profile()["buyer"]
+        buyer = get_profile(username)["buyer"]
         result: dict = {}
         if buyer.get("first_name"):
             result["first_name"] = buyer["first_name"]
@@ -424,12 +426,18 @@ class Shop:
             result["phone_number"] = buyer["phone"]  # UCP checkout uses phone_number
         return result
 
-    def session(self, session_id: str | None) -> Session:
-        if session_id in self.sessions:
-            return self.sessions[session_id]
+    def session(self, session_id: str | None, username: str) -> Session:
+        """This user's session with that id, or a new one.
+
+        Carts and an open checkout live on the session, so it is never shared:
+        an id belonging to another user simply starts a fresh session here.
+        """
+        existing = self.sessions.get(session_id)
+        if existing and existing.username == username:
+            return existing
         if len(self.sessions) >= MAX_SESSIONS:
             self.sessions.pop(next(iter(self.sessions)))  # drop the oldest
-        session = Session(id=str(uuid.uuid4()))
+        session = Session(id=str(uuid.uuid4()), username=username)
         self.sessions[session.id] = session
         return session
 
@@ -467,7 +475,7 @@ class Shop:
         Run one to MAX_SEARCHES searches together, each {query, categories, low, high}.
         Several searches (e.g. shoes and a dining table) are shown side by side.
         """
-        ctx = self._market_context()
+        ctx = self._market_context(session.username)
         session.searches = []
         for wanted in searches[:MAX_SEARCHES]:
             stores, why = self.stores_for(wanted["categories"])
@@ -573,7 +581,7 @@ class Shop:
         if not known:
             return [notice("warning", "Search for the product first, then ask for its details.")]
         merchant = self.store_of(known)
-        ctx = self._market_context()
+        ctx = self._market_context(session.username)
         request: dict = {"id": product_id}
         if ctx:
             request["context"] = ctx
@@ -652,7 +660,7 @@ class Shop:
         preference changes take effect on the next cart operation.
         """
         items = [{"item": {"id": variant_id}, "quantity": qty} for variant_id, qty in lines.items()]
-        ctx = self._market_context()
+        ctx = self._market_context(session.username)
         cart: dict = {"line_items": items}
         if ctx:
             cart["context"] = ctx
@@ -726,7 +734,7 @@ class Shop:
         # Pre-fill buyer details from the persisted profile if the session has none yet.
         # This spares the shopper from re-entering info they already saved.
         if not session.buyer:
-            profile_buyer = self._profile_buyer()
+            profile_buyer = self._profile_buyer(session.username)
             if profile_buyer:
                 session.buyer.update(profile_buyer)
 
@@ -822,7 +830,7 @@ class Shop:
         Signals (IP, User-Agent) are included when available.
         """
         lines = session.checkout.get("line_items") or []
-        ctx = self._market_context()
+        ctx = self._market_context(session.username)
         # A confirmed shipping address country supersedes the profile preference hint.
         if session.address:
             ctx["address_country"] = session.address["address_country"]

@@ -244,10 +244,13 @@ class Agent:
         if self.client:
             logger.info(f"Chat runs on the dentsu AI gateway, deployment {self.model}")
 
-    async def reply(self, message: str, session_id: str | None,
+    async def reply(self, message: str, session_id: str | None, username: str,
                     request_signals: dict | None = None) -> dict:
-        """One chat turn. request_signals carries IP/UA from the HTTP layer for UCP forwarding."""
-        session = self.shop.session(session_id)
+        """One chat turn for one logged-in user.
+
+        request_signals carries IP/UA from the HTTP layer for UCP forwarding.
+        """
+        session = self.shop.session(session_id, username)
         # Store the current request's signals on the session so shop methods can include them.
         # They are never persisted to the profile database.
         if request_signals:
@@ -272,10 +275,10 @@ class Agent:
         blocks = ([{"type": "text", "text": text}] if text else []) + blocks
         return self.response(session, blocks)
 
-    async def submit_details(self, session_id: str | None, details: dict,
+    async def submit_details(self, session_id: str | None, details: dict, username: str,
                              request_signals: dict | None = None) -> dict:
         """The checkout card's delivery details form: saved straight through the shop, no model call."""
-        session = self.shop.session(session_id)
+        session = self.shop.session(session_id, username)
         if request_signals:
             session.signals = request_signals
         blocks = await self.shop.update_checkout(session, details)
@@ -284,10 +287,10 @@ class Agent:
                             {"role": "assistant", "content": "Saved the delivery details on the checkout."}]
         return self.response(session, blocks)
 
-    async def start_checkout(self, session_id: str | None, store_id: str,
+    async def start_checkout(self, session_id: str | None, store_id: str, username: str,
                              request_signals: dict | None = None) -> dict:
         """A cart card's Checkout button: opens that store's checkout directly, no model call."""
-        session = self.shop.session(session_id)
+        session = self.shop.session(session_id, username)
         if request_signals:
             session.signals = request_signals
         blocks = await self.shop.start_checkout(session, store_id)

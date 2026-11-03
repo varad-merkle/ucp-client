@@ -5,12 +5,20 @@ each store's /.well-known/ucp to find its MCP endpoint (merchants.py). Every sto
 goes through call_mcp(), which adds meta.ucp-agent (and an idempotency key where UCP
 requires one), logs the call and records it in the exchange log.
 
+Each user logs in with an account from the app_user table (auth.py) and gets a token. The
+endpoints marked (auth) below need it as `Authorization: Bearer <token>`, and act on
+the buyer profile belonging to that user - their own name, email and market
+preferences are what reach the stores over UCP.
+
     GET  /profile.json                our UCP platform profile
-    GET  /api/profile                 get the persisted buyer profile
-    PATCH /api/profile                update buyer or market preferences
-    POST /api/chat                    one chat turn (agent.py + shop.py)
-    POST /api/checkout/details        the checkout card's delivery details form
-    POST /api/checkout/start          a cart card's Checkout button, for one store
+    POST /api/login                   log in, returns a token
+    POST /api/logout                  (auth) invalidate the token
+    GET  /api/me                      (auth) who the token belongs to
+    GET  /api/profile                 (auth) get this user's buyer profile
+    PATCH /api/profile                (auth) update this user's buyer or market preferences
+    POST /api/chat                    (auth) one chat turn (agent.py + shop.py)
+    POST /api/checkout/details        (auth) the checkout card's delivery details form
+    POST /api/checkout/start          (auth) a cart card's Checkout button, for one store
     GET  /api/health                  status of this client and the stores
     GET  /api/merchants               the stores, their categories and what discovery found
     GET  /api/exchanges               recent store calls (exchange log)
@@ -34,7 +42,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from mcp import Client
@@ -51,6 +59,7 @@ from ucp_sdk.models.schemas.shopping.checkout_create_request import CheckoutCrea
 from ucp_sdk.models.schemas.shopping.checkout_update_request import CheckoutUpdateRequest
 from ucp_sdk.models.schemas.shopping.types.line_item_create_request import LineItemCreateRequest
 
+import auth
 from agent import Agent
 from merchants import Merchant, Registry
 from profile_store import get_profile, init_db, update_profile
@@ -109,7 +118,9 @@ MAX_EXCHANGES = 200
 async def lifespan(app: FastAPI):
     global public_url
 
-    # 1. Initialize the buyer profile database before any request is served.
+    # 1. Prepare the database before any request is served. Accounts come first:
+    #    a buyer profile belongs to a user, so app_user must exist before it.
+    auth.init_auth()
     init_db()
     logger.info("Buyer profile database ready")
 
@@ -293,6 +304,53 @@ async def get_agent_profile(request: Request):
     return JSONResponse(profile, headers=headers)
 
 
+# ------------------------------------------------------------ login
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def current_user(authorization: str = Header(default="")) -> str:
+    """The logged-in user for this request, from `Authorization: Bearer <token>`.
+
+    Endpoints that touch a buyer profile depend on this, so the username they act
+    on always comes from a verified token and never from the request body.
+    """
+    token = authorization.removeprefix("Bearer ").strip()
+    username = auth.username_for(token) if token else None
+    if not username:
+        raise HTTPException(status_code=401, detail="Log in to continue")
+    return username
+
+
+@app.post("/api/login")
+async def log_in(body: LoginRequest):
+    """Exchange an account's username and password for a token."""
+    token = auth.login(body.username, body.password)
+    if not token:
+        # The same message either way: it must not reveal which accounts exist.
+        logger.info(f"Login failed for {body.username!r}")
+        raise HTTPException(status_code=401, detail="Wrong username or password")
+    logger.info(f"Logged in: {body.username}")
+    return {"token": token, "username": body.username}
+
+
+@app.post("/api/logout")
+async def log_out(authorization: str = Header(default=""), username: str = Depends(current_user)):
+    """Invalidate this token. The user's saved profile is untouched."""
+    auth.logout(authorization.removeprefix("Bearer ").strip())
+    logger.info(f"Logged out: {username}")
+    return {"status": "logged out"}
+
+
+@app.get("/api/me")
+async def who_am_i(username: str = Depends(current_user)):
+    """Who the token belongs to. Lets the frontend check a stored token on page load."""
+    return {"username": username}
+
+
 # ------------------------------------------------------------ buyer profile
 
 
@@ -320,14 +378,14 @@ class ProfilePatch(BaseModel):
 
 
 @app.get("/api/profile")
-async def read_buyer_profile():
-    """Return the persisted buyer profile (buyer info + market preferences)."""
-    return get_profile()
+async def read_buyer_profile(username: str = Depends(current_user)):
+    """Return this user's buyer profile (buyer info + market preferences)."""
+    return get_profile(username)
 
 
 @app.patch("/api/profile")
-async def patch_buyer_profile(body: ProfilePatch):
-    """Partially update the buyer profile.
+async def patch_buyer_profile(body: ProfilePatch, username: str = Depends(current_user)):
+    """Partially update this user's buyer profile.
 
     Only explicitly provided fields are changed. An explicit null clears a field.
     Fields absent from the request body are preserved unchanged.
@@ -335,7 +393,7 @@ async def patch_buyer_profile(body: ProfilePatch):
     buyer = body.buyer.model_dump(exclude_unset=True) if body.buyer else {}
     market = body.market.model_dump(exclude_unset=True) if body.market else {}
     try:
-        return update_profile(buyer, market)
+        return update_profile(username, buyer, market)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -370,11 +428,11 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/api/chat")
-async def chat_turn(body: ChatRequest, request: Request):
+async def chat_turn(body: ChatRequest, request: Request, username: str = Depends(current_user)):
     """One chat turn: the reply is a list of blocks the frontend renders."""
-    logger.info(f"Chat: {body.message!r}")
+    logger.info(f"Chat [{username}]: {body.message!r}")
     signals = _extract_signals(request)
-    reply = await agent.reply(body.message, body.session_id, signals)
+    reply = await agent.reply(body.message, body.session_id, username, signals)
     logger.info(f"Reply: {', '.join(block['type'] for block in reply['blocks'])}")
     return reply
 
@@ -397,12 +455,13 @@ class CheckoutDetailsRequest(BaseModel):
 
 
 @app.post("/api/checkout/details")
-async def checkout_details(body: CheckoutDetailsRequest, request: Request):
+async def checkout_details(body: CheckoutDetailsRequest, request: Request,
+                           username: str = Depends(current_user)):
     """The checkout card's delivery details form: saved on the checkout in one update."""
-    logger.info("Chat: delivery details form submitted")
+    logger.info(f"Chat [{username}]: delivery details form submitted")
     details = {k: (v.strip() or None) if isinstance(v, str) else v for k, v in body.details.model_dump().items()}
     signals = _extract_signals(request)
-    return await agent.submit_details(body.session_id, details, signals)
+    return await agent.submit_details(body.session_id, details, username, signals)
 
 
 class StartCheckoutRequest(BaseModel):
@@ -411,12 +470,13 @@ class StartCheckoutRequest(BaseModel):
 
 
 @app.post("/api/checkout/start")
-async def start_checkout(body: StartCheckoutRequest, request: Request):
+async def start_checkout(body: StartCheckoutRequest, request: Request,
+                         username: str = Depends(current_user)):
     """A cart card's Checkout button: opens the checkout for that card's store."""
     if not registry.get(body.store):
         raise HTTPException(status_code=404, detail=f"Unknown store {body.store}")
-    logger.info(f"Chat: checkout button pressed for {body.store}")
-    reply = await agent.start_checkout(body.session_id, body.store, _extract_signals(request))
+    logger.info(f"Chat [{username}]: checkout button pressed for {body.store}")
+    reply = await agent.start_checkout(body.session_id, body.store, username, _extract_signals(request))
     logger.info(f"Reply: {', '.join(block['type'] for block in reply['blocks'])}")
     return reply
 
