@@ -42,9 +42,10 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from mcp import Client
 from mcp_types import TextContent
 from pydantic import BaseModel
@@ -312,13 +313,22 @@ class LoginRequest(BaseModel):
     password: str
 
 
-def current_user(authorization: str = Header(default="")) -> str:
+# Declared as a security scheme (not a plain header) so /docs shows an Authorize button;
+# Swagger UI ignores a header parameter named Authorization and would never send it.
+bearer = HTTPBearer(auto_error=False)
+
+
+def bearer_token(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> str:
+    """The token from `Authorization: Bearer <token>`, or an empty string if there is none."""
+    return credentials.credentials if credentials else ""
+
+
+def current_user(token: str = Depends(bearer_token)) -> str:
     """The logged-in user for this request, from `Authorization: Bearer <token>`.
 
     Endpoints that touch a buyer profile depend on this, so the username they act
     on always comes from a verified token and never from the request body.
     """
-    token = authorization.removeprefix("Bearer ").strip()
     username = auth.username_for(token) if token else None
     if not username:
         raise HTTPException(status_code=401, detail="Log in to continue")
@@ -338,9 +348,9 @@ async def log_in(body: LoginRequest):
 
 
 @app.post("/api/logout")
-async def log_out(authorization: str = Header(default=""), username: str = Depends(current_user)):
+async def log_out(token: str = Depends(bearer_token), username: str = Depends(current_user)):
     """Invalidate this token. The user's saved profile is untouched."""
-    auth.logout(authorization.removeprefix("Bearer ").strip())
+    auth.logout(token)
     logger.info(f"Logged out: {username}")
     return {"status": "logged out"}
 
