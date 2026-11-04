@@ -12,6 +12,13 @@
       ]
     },
     "capabilities": {
+      "dev.ucp.common.identity_linking": [
+        {
+          "version": "2026-08-25",
+          "spec": "https://ucp.dev/2026-08-25/specification/common/identity-linking/",
+          "schema": "https://ucp.dev/2026-08-25/schemas/common/identity_linking.json"
+        }
+      ],
       "dev.ucp.shopping.checkout": [
         {
           "version": "2026-08-25",
