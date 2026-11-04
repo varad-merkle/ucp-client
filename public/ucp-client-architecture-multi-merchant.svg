@@ -1,0 +1,271 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1110" viewBox="0 0 1800 1110" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <title>UCP Platform Client - Multi-Merchant System Architecture</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2E8B73"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6B4FBB"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#C77D16"/>
+    </marker>
+    <style>
+      .title { font-size: 22px; font-weight: 700; fill: #1a1a1a; }
+      .subtitle { font-size: 13px; fill: #555; }
+      .group { font-size: 15px; font-weight: 700; }
+      .box-title { font-size: 13px; font-weight: 700; fill: #1a1a1a; }
+      .box-text { font-size: 12px; fill: #333; }
+      .note { font-size: 11px; fill: #555; }
+      .label { font-size: 11px; fill: #444; }
+      .mono { font-family: Consolas, Menlo, monospace; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1110" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="20" y="32" class="title">UCP Platform Client — Multi-Merchant System Architecture</text>
+  <text x="20" y="56" class="subtitle">UCP platform/agent client · FastAPI + MCP (JSON-RPC) · official ucp_sdk models · merchant registry (merchants.json) · LLM-chosen categories · SQLite buyer profile · updated 2026-10-23</text>
+
+  <!-- Legend -->
+  <rect x="1400" y="12" width="380" height="128" rx="6" fill="#fff" stroke="#bbb"/>
+  <text x="1414" y="32" class="box-title">Legend</text>
+  <rect x="1414" y="43" width="18" height="14" rx="2" fill="#DCE3FA" stroke="#3B5BDB"/>
+  <text x="1440" y="54" class="box-text">REST API endpoint</text>
+  <rect x="1414" y="67" width="18" height="14" rx="2" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="1440" y="78" class="box-text">MCP transport / tool call</text>
+  <rect x="1414" y="91" width="18" height="14" rx="2" fill="#D3EFE5" stroke="#2E8B73"/>
+  <text x="1440" y="102" class="box-text">Config &amp; discovery</text>
+  <rect x="1414" y="115" width="18" height="14" rx="2" fill="#E4DAF7" stroke="#6B4FBB"/>
+  <text x="1440" y="126" class="box-text">Persistence (SQLite)</text>
+  <rect x="1600" y="43" width="18" height="14" rx="2" fill="#F7D9E6" stroke="#B9437A"/>
+  <text x="1626" y="54" class="box-text">Agent / LLM</text>
+  <rect x="1600" y="67" width="18" height="14" rx="2" fill="#fff" stroke="#555"/>
+  <text x="1626" y="78" class="box-text">Deterministic Python</text>
+  <rect x="1600" y="91" width="18" height="14" rx="2" fill="#fff" stroke="#888" stroke-dasharray="4 3"/>
+  <text x="1626" y="102" class="box-text">External / third-party</text>
+  <rect x="1600" y="115" width="18" height="14" rx="2" fill="#FFF8EE" stroke="#D08A1E"/>
+  <text x="1626" y="126" class="box-text">UCP merchant</text>
+
+  <!-- Row 1: Frontend -->
+  <rect x="20" y="90" width="1180" height="86" rx="6" fill="#FAFAFA" stroke="#888" stroke-dasharray="5 4"/>
+  <text x="34" y="110" class="group" fill="#555">Client — Buyer / Frontend UI (ucp-frontend, separate repo)</text>
+  <rect x="40" y="120" width="1140" height="44" rx="6" fill="#fff" stroke="#888" stroke-dasharray="5 4"/>
+  <text x="610" y="138" text-anchor="middle" class="box-title">Frontend UI (React + Vite)</text>
+  <text x="610" y="155" text-anchor="middle" class="box-text">chat · product cards with the store name · one cart card per store · checkout card + delivery details form · protocol log</text>
+
+  <line x1="610" y1="176" x2="610" y2="207" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <text x="620" y="197" class="label">HTTP JSON · /api/*</text>
+
+  <!-- Row 2: REST API -->
+  <rect x="20" y="210" width="1180" height="170" rx="6" fill="#EEF2FC" stroke="#3B5BDB"/>
+  <text x="34" y="232" class="group" fill="#2B4AC4">REST API surface — client.py (FastAPI :7000)</text>
+
+  <rect x="40" y="246" width="270" height="96" rx="6" fill="#DCE3FA" stroke="#3B5BDB"/>
+  <text x="175" y="268" text-anchor="middle" class="box-title">Chat</text>
+  <text x="175" y="288" text-anchor="middle" class="box-text mono">POST /api/chat</text>
+  <text x="175" y="306" text-anchor="middle" class="box-text mono">POST /api/checkout/details</text>
+  <text x="175" y="326" text-anchor="middle" class="box-text">signals: buyer IP, user agent</text>
+
+  <rect x="330" y="246" width="270" height="96" rx="6" fill="#DCE3FA" stroke="#3B5BDB"/>
+  <text x="465" y="268" text-anchor="middle" class="box-title">Buyer profile</text>
+  <text x="465" y="288" text-anchor="middle" class="box-text mono">GET /api/profile</text>
+  <text x="465" y="306" text-anchor="middle" class="box-text mono">PATCH /api/profile</text>
+  <text x="465" y="326" text-anchor="middle" class="box-text">partial update, validated fields</text>
+
+  <rect x="620" y="246" width="270" height="96" rx="6" fill="#DCE3FA" stroke="#3B5BDB"/>
+  <text x="755" y="268" text-anchor="middle" class="box-title">Discovery &amp; status</text>
+  <text x="755" y="288" text-anchor="middle" class="box-text mono">GET /profile.json</text>
+  <text x="755" y="306" text-anchor="middle" class="box-text mono">GET /api/merchants · /api/health</text>
+  <text x="755" y="326" text-anchor="middle" class="box-text mono">GET | DELETE /api/exchanges</text>
+
+  <rect x="910" y="246" width="270" height="96" rx="6" fill="#DCE3FA" stroke="#3B5BDB"/>
+  <text x="1045" y="268" text-anchor="middle" class="box-title">Direct MCP endpoints</text>
+  <text x="1045" y="288" text-anchor="middle" class="box-text mono">/api/mcp/{catalog,cart,checkout}/*</text>
+  <text x="1045" y="306" text-anchor="middle" class="box-text mono">?merchant=&lt;id&gt; (default pier1)</text>
+  <text x="1045" y="326" text-anchor="middle" class="box-text">complete_checkout switched off</text>
+
+  <text x="34" y="366" class="note">Request bodies are validated by the official ucp_sdk pydantic models. Payment is not enabled: checkout stops at reviewing the details.</text>
+
+  <line x1="175" y1="342" x2="175" y2="407" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <text x="185" y="399" class="label">agent.reply(message, session, signals)</text>
+
+  <!-- Row 3 left: Agent -->
+  <rect x="20" y="410" width="560" height="260" rx="6" fill="#FCEFF4" stroke="#B9437A"/>
+  <text x="34" y="432" class="group" fill="#9C2F63">Agent — agent.py (the LLM decides, the code acts)</text>
+
+  <rect x="40" y="446" width="520" height="50" rx="6" fill="#fff" stroke="#888" stroke-dasharray="5 4"/>
+  <text x="300" y="466" text-anchor="middle" class="box-title">gpt-4.1 on the dentsu AI gateway (Azure OpenAI)</text>
+  <text x="300" y="484" text-anchor="middle" class="box-text">chat.completions with strict function tools · up to 6 tool rounds per message</text>
+
+  <rect x="40" y="508" width="520" height="70" rx="6" fill="#F7D9E6" stroke="#B9437A"/>
+  <text x="300" y="528" text-anchor="middle" class="box-title">Prompt and tools built from the registry</text>
+  <text x="300" y="547" text-anchor="middle" class="box-text">system prompt lists every store and the categories it sells</text>
+  <text x="300" y="565" text-anchor="middle" class="box-text mono">search_products(query, categories[1-3] ∈ merchants.json, price)</text>
+
+  <rect x="40" y="590" width="520" height="66" rx="6" fill="#fff" stroke="#555"/>
+  <text x="300" y="609" text-anchor="middle" class="box-title">Other tools</text>
+  <text x="300" y="627" text-anchor="middle" class="box-text">get_product_details · add_to_cart · set_cart_quantity · view_cart · empty_cart</text>
+  <text x="300" y="644" text-anchor="middle" class="box-text">start_checkout(store) · update_checkout_details · choose_delivery_option · cancel</text>
+
+  <line x1="580" y1="540" x2="617" y2="540" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <text x="599" y="532" text-anchor="middle" class="label">tools</text>
+
+  <!-- Row 3 right: Shop -->
+  <rect x="620" y="410" width="580" height="260" rx="6" fill="#F7F7F7" stroke="#555"/>
+  <text x="634" y="432" class="group" fill="#333">Shopping session — shop.py (deterministic UCP actions)</text>
+
+  <rect x="640" y="446" width="540" height="66" rx="6" fill="#fff" stroke="#555"/>
+  <text x="910" y="465" text-anchor="middle" class="box-title">Category routing</text>
+  <text x="910" y="483" text-anchor="middle" class="box-text">stores_for(categories) → registry.selling() → stores ranked by matching categories</text>
+  <text x="910" y="500" text-anchor="middle" class="box-text">search_catalog at each store in parallel · every product tagged with its store</text>
+
+  <rect x="640" y="522" width="540" height="66" rx="6" fill="#fff" stroke="#555"/>
+  <text x="910" y="541" text-anchor="middle" class="box-title">Session state (per chat)</text>
+  <text x="910" y="559" text-anchor="middle" class="box-text">carts: {merchant id → cart} · one checkout open at a time (checkout_store)</text>
+  <text x="910" y="576" text-anchor="middle" class="box-text">buyer and address shared across stores · signals kept in memory only</text>
+
+  <rect x="640" y="598" width="540" height="62" rx="6" fill="#E4DAF7" stroke="#6B4FBB"/>
+  <text x="910" y="617" text-anchor="middle" class="box-title">Buyer context</text>
+  <text x="910" y="634" text-anchor="middle" class="box-text">_market_context(): currency, country, language, region, postcode from the profile</text>
+  <text x="910" y="651" text-anchor="middle" class="box-text">_profile_buyer() pre-fills a new checkout · shipping country overrides the profile's</text>
+
+  <line x1="910" y1="670" x2="910" y2="697" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <text x="920" y="690" class="label">call_mcp(merchant, tool, args)</text>
+
+  <!-- Row 4: MCP transport -->
+  <rect x="20" y="700" width="1180" height="170" rx="6" fill="#FDF5EA" stroke="#C77D16"/>
+  <text x="34" y="722" class="group" fill="#A8650E">MCP transport — call_mcp(merchant, tool, args) · one request pattern for every store</text>
+
+  <rect x="40" y="736" width="360" height="96" rx="6" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="220" y="757" text-anchor="middle" class="box-title">Request builder</text>
+  <text x="220" y="776" text-anchor="middle" class="box-text">meta.ucp-agent.profile = &lt;public_url&gt;/profile.json</text>
+  <text x="220" y="794" text-anchor="middle" class="box-text">idempotency-key: cancel_cart, complete / cancel checkout</text>
+  <text x="220" y="812" text-anchor="middle" class="box-text">catalog | cart | checkout, plus context and signals</text>
+
+  <line x1="400" y1="784" x2="427" y2="784" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <rect x="430" y="736" width="360" height="96" rx="6" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="610" y="757" text-anchor="middle" class="box-title">MCP client</text>
+  <text x="610" y="776" text-anchor="middle" class="box-text mono">Client(merchant.endpoint).call_tool(tool, args)</text>
+  <text x="610" y="794" text-anchor="middle" class="box-text">JSON-RPC tools/call</text>
+  <text x="610" y="812" text-anchor="middle" class="box-text">endpoint read from the store's /.well-known/ucp</text>
+
+  <line x1="790" y1="784" x2="817" y2="784" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <rect x="820" y="736" width="360" height="96" rx="6" fill="#fff" stroke="#555"/>
+  <text x="1000" y="757" text-anchor="middle" class="box-title">Response handler</text>
+  <text x="1000" y="776" text-anchor="middle" class="box-text">structuredContent, else TextContent → JSON</text>
+  <text x="1000" y="794" text-anchor="middle" class="box-text">UCP business errors stay UCP responses</text>
+  <text x="1000" y="812" text-anchor="middle" class="box-text">log_exchange(): store, tool, timing → protocol log</text>
+
+  <text x="34" y="856" class="note">A store that fails a call is reported as a notice; results from the other stores still come back.</text>
+
+  <!-- MCP transport to merchants -->
+  <line x1="1200" y1="822" x2="1257" y2="822" stroke="#C77D16" stroke-width="1.6" marker-end="url(#arrow-orange)"/>
+
+  <!-- Row 5: Lifespan -->
+  <rect x="20" y="900" width="1180" height="190" rx="6" fill="#EEF8F4" stroke="#2E8B73"/>
+  <text x="34" y="922" class="group" fill="#22705C">FastAPI lifespan — startup (runs once at boot)</text>
+
+  <rect x="40" y="936" width="270" height="110" rx="6" fill="#E4DAF7" stroke="#6B4FBB"/>
+  <text x="175" y="958" text-anchor="middle" class="box-title">1 · init_db()</text>
+  <text x="175" y="978" text-anchor="middle" class="box-text">creates buyer_profile.db</text>
+  <text x="175" y="996" text-anchor="middle" class="box-text">table + seed row id = 1</text>
+  <text x="175" y="1014" text-anchor="middle" class="box-text">existing data kept on restart</text>
+
+  <line x1="310" y1="991" x2="327" y2="991" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <rect x="330" y="936" width="270" height="110" rx="6" fill="#fff" stroke="#888" stroke-dasharray="5 4"/>
+  <text x="465" y="958" text-anchor="middle" class="box-title">2 · ngrok tunnel :7000</text>
+  <text x="465" y="978" text-anchor="middle" class="box-text">→ public_url</text>
+  <text x="465" y="996" text-anchor="middle" class="box-text">stores fetch our agent profile at</text>
+  <text x="465" y="1014" text-anchor="middle" class="box-text mono">&lt;public_url&gt;/profile.json</text>
+
+  <line x1="600" y1="991" x2="617" y2="991" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <rect x="620" y="936" width="270" height="110" rx="6" fill="#D3EFE5" stroke="#2E8B73"/>
+  <text x="755" y="958" text-anchor="middle" class="box-title">3 · Registry()</text>
+  <text x="755" y="978" text-anchor="middle" class="box-text">loads merchants.json:</text>
+  <text x="755" y="996" text-anchor="middle" class="box-text">id, name, url, categories</text>
+  <text x="755" y="1014" text-anchor="middle" class="box-text">categories are ours to maintain</text>
+  <text x="755" y="1032" text-anchor="middle" class="box-text">(UCP has no field for them)</text>
+
+  <line x1="890" y1="991" x2="907" y2="991" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <rect x="910" y="936" width="270" height="110" rx="6" fill="#D3EFE5" stroke="#2E8B73"/>
+  <text x="1045" y="958" text-anchor="middle" class="box-title">4 · discover_all()</text>
+  <text x="1045" y="978" text-anchor="middle" class="box-text">each store: GET /.well-known/ucp</text>
+  <text x="1045" y="996" text-anchor="middle" class="box-text">no redirects · cached ≥ 60 s</text>
+  <text x="1045" y="1014" text-anchor="middle" class="box-text">version check → MCP endpoint</text>
+  <text x="1045" y="1032" text-anchor="middle" class="box-text">capabilities ∩ ours</text>
+
+  <text x="34" y="1074" class="note">A store that fails discovery or speaks another UCP version is marked unavailable and skipped; the other stores keep working.</text>
+
+  <!-- Discovery: lifespan to merchants -->
+  <path d="M1045,936 V886 H1290 V873" fill="none" stroke="#2E8B73" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arrow-teal)"/>
+  <text x="1060" y="882" class="label" fill="#22705C">GET /.well-known/ucp</text>
+
+  <!-- Right column: ngrok -->
+  <rect x="1240" y="150" width="540" height="60" rx="6" fill="#fff" stroke="#888" stroke-dasharray="5 4"/>
+  <text x="1510" y="173" text-anchor="middle" class="box-title">ngrok (public tunnel)</text>
+  <text x="1510" y="192" text-anchor="middle" class="box-text">public_url → client.py :7000, so stores can read our UCP-Agent profile</text>
+  <path d="M1240,180 H1220 V262 H1203" fill="none" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <!-- Right column: merchants -->
+  <rect x="1240" y="230" width="540" height="640" rx="6" fill="#FFF8EE" stroke="#D08A1E"/>
+  <text x="1254" y="252" class="group" fill="#A8650E">External — UCP merchants (Business MCP servers)</text>
+  <text x="1254" y="270" class="note">listed in merchants.json · each store owns its own cart, checkout and payment</text>
+  <line x1="1510" y1="230" x2="1510" y2="213" stroke="#555" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#arrow)"/>
+
+  <rect x="1260" y="284" width="500" height="112" rx="6" fill="#fff" stroke="#D08A1E"/>
+  <text x="1276" y="305" class="box-title">Pier 1 <tspan class="box-text" font-weight="400">· https://www.pier1.com</tspan></text>
+  <text x="1276" y="325" class="box-text">home decoration, rugs, furniture, dining room sets, papasan chairs,</text>
+  <text x="1276" y="343" class="box-text">outdoor living, indoor styling, accessories, seasons, holidays, birthdays</text>
+  <text x="1276" y="363" class="box-text mono">MCP: p1-dev.myshopify.com/api/ucp/mcp</text>
+  <text x="1276" y="383" class="note">furniture overlaps with Furniture City</text>
+
+  <rect x="1260" y="410" width="500" height="112" rx="6" fill="#fff" stroke="#D08A1E"/>
+  <text x="1276" y="431" class="box-title">Furniture City <tspan class="box-text" font-weight="400">· https://furniturecity.com</tspan></text>
+  <text x="1276" y="451" class="box-text">furniture, sofas, sectionals, bedroom sets, dining sets, mattresses</text>
+  <text x="1276" y="471" class="box-text mono">MCP: furniture-city-cal.myshopify.com/api/ucp/mcp</text>
+  <text x="1276" y="491" class="note">"sofa" → furniture + sofas → Furniture City ranked first, then Pier 1</text>
+
+  <rect x="1260" y="536" width="500" height="112" rx="6" fill="#fff" stroke="#D08A1E"/>
+  <text x="1276" y="557" class="box-title">Allbirds <tspan class="box-text" font-weight="400">· https://www.allbirds.com</tspan></text>
+  <text x="1276" y="577" class="box-text">shoes, footwear, sneakers, sandals, slipons</text>
+  <text x="1276" y="597" class="box-text mono">MCP: weareallbirds.myshopify.com/api/ucp/mcp</text>
+  <text x="1276" y="617" class="note">www host registered: allbirds.com redirects, and UCP forbids following it</text>
+
+  <rect x="1260" y="662" width="500" height="112" rx="6" fill="#fff" stroke="#D08A1E"/>
+  <text x="1276" y="683" class="box-title">Auto-Xpert <tspan class="box-text" font-weight="400">· https://auto-xpert.co.uk</tspan></text>
+  <text x="1276" y="703" class="box-text">car care, car cleaning, car detailing, car accessories,</text>
+  <text x="1276" y="721" class="box-text">car interior, car exterior, car parts</text>
+  <text x="1276" y="741" class="box-text mono">MCP: auto-xpert.myshopify.com/api/ucp/mcp</text>
+  <text x="1276" y="761" class="note">catalog priced in GBP</text>
+
+  <rect x="1260" y="788" width="500" height="68" rx="6" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="1510" y="807" text-anchor="middle" class="box-title">Every store: UCP 2026-08-25 over MCP</text>
+  <text x="1510" y="825" text-anchor="middle" class="box-text">search_catalog · lookup_catalog · get_product · create / get / update / cancel_cart</text>
+  <text x="1510" y="843" text-anchor="middle" class="box-text">create / get / update / complete / cancel_checkout · get_order</text>
+
+  <!-- Right column: SQLite -->
+  <rect x="1240" y="900" width="540" height="190" rx="6" fill="#F3EEFB" stroke="#6B4FBB"/>
+  <text x="1254" y="922" class="group" fill="#563BA3">Persistence — profile_store.py · SQLite buyer_profile.db</text>
+  <rect x="1260" y="936" width="500" height="92" rx="6" fill="#E4DAF7" stroke="#6B4FBB"/>
+  <text x="1510" y="956" text-anchor="middle" class="box-title">buyer_profile (one row, id = 1)</text>
+  <text x="1510" y="975" text-anchor="middle" class="box-text">buyer: first_name · last_name · email · phone</text>
+  <text x="1510" y="993" text-anchor="middle" class="box-text">market: country · preferred_currency · language · region · postal_code</text>
+  <text x="1510" y="1011" text-anchor="middle" class="box-text">schema_version · updated_at (ISO 8601 UTC)</text>
+  <text x="1254" y="1048" class="note">Created at startup by init_db(). One shared profile per running instance (POC).</text>
+  <text x="1254" y="1063" class="note">Read on every catalog, cart and checkout call; written only through PATCH /api/profile.</text>
+  <text x="1254" y="1078" class="note">Request signals (IP address, user agent) are never stored.</text>
+
+  <!-- Profile reads/writes: REST profile and shop buyer context to SQLite -->
+  <path d="M1200,300 H1222 V962 H1257" fill="none" stroke="#6B4FBB" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arrow-purple)"/>
+  <path d="M1200,629 H1222" fill="none" stroke="#6B4FBB" stroke-width="1.4" stroke-dasharray="5 4"/>
+</svg>

@@ -1,0 +1,258 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1070" viewBox="0 0 1800 1070" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <title>UCP Platform Client - Request Pattern, Checkout Flow and Lifecycle</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#B23A3A"/>
+    </marker>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#999"/>
+    </marker>
+    <style>
+      .title { font-size: 22px; font-weight: 700; fill: #1a1a1a; }
+      .subtitle { font-size: 13px; fill: #555; }
+      .group { font-size: 15px; font-weight: 700; }
+      .box-title { font-size: 13px; font-weight: 700; fill: #1a1a1a; }
+      .box-text { font-size: 12px; fill: #333; }
+      .note { font-size: 11px; fill: #555; }
+      .label { font-size: 11px; fill: #444; }
+      .mono { font-family: Consolas, Menlo, monospace; font-size: 12px; fill: #333; }
+      .mono-head { font-family: Consolas, Menlo, monospace; font-size: 12px; font-weight: 700; fill: #1a1a1a; }
+      .comment { font-family: Consolas, Menlo, monospace; font-size: 12px; fill: #7a7a7a; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1070" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="20" y="32" class="title">UCP Platform Client — Request Pattern, Checkout Flow &amp; Lifecycle</text>
+  <text x="20" y="56" class="subtitle">Every store call goes through call_mcp(merchant, tool, args) · each store has its own cart and checkout · one checkout open at a time · payment switched off · updated 2026-10-23</text>
+
+  <!-- Legend -->
+  <rect x="1400" y="12" width="380" height="104" rx="6" fill="#fff" stroke="#bbb"/>
+  <text x="1414" y="32" class="box-title">Legend</text>
+  <rect x="1414" y="43" width="18" height="14" rx="2" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="1440" y="54" class="box-text">MCP call / UCP tool</text>
+  <rect x="1414" y="67" width="18" height="14" rx="2" fill="#D3EFE5" stroke="#2E8B73"/>
+  <text x="1440" y="78" class="box-text">Store routing</text>
+  <rect x="1414" y="91" width="18" height="14" rx="2" fill="#E4DAF7" stroke="#6B4FBB"/>
+  <text x="1440" y="102" class="box-text">Buyer profile (SQLite)</text>
+  <rect x="1600" y="43" width="18" height="14" rx="2" fill="#DCE3FA" stroke="#3B5BDB"/>
+  <text x="1626" y="54" class="box-text">Session state</text>
+  <rect x="1600" y="67" width="18" height="14" rx="2" fill="#fff" stroke="#555"/>
+  <text x="1626" y="78" class="box-text">Deterministic Python</text>
+  <rect x="1600" y="91" width="18" height="14" rx="2" fill="#fff" stroke="#999" stroke-dasharray="4 3"/>
+  <text x="1626" y="102" class="box-text">Off / not reached</text>
+
+  <!-- Panel A: request pattern -->
+  <rect x="20" y="130" width="1760" height="190" rx="6" fill="#FDF5EA" stroke="#C77D16"/>
+  <text x="34" y="152" class="group" fill="#A8650E">Request pattern — call_mcp(merchant, tool, args): every store call, from the chat or an /api/mcp/* endpoint</text>
+
+  <rect x="40" y="168" width="196" height="120" rx="6" fill="#fff" stroke="#555"/>
+  <text x="138" y="190" text-anchor="middle" class="box-title">1 · Caller</text>
+  <text x="138" y="210" text-anchor="middle" class="box-text">chat: a shop.py action</text>
+  <text x="138" y="228" text-anchor="middle" class="box-text">direct: an /api/mcp/* endpoint</text>
+  <text x="138" y="246" text-anchor="middle" class="box-text">tool arguments: catalog,</text>
+  <text x="138" y="264" text-anchor="middle" class="box-text">cart, checkout or id</text>
+
+  <rect x="254" y="168" width="196" height="120" rx="6" fill="#D3EFE5" stroke="#2E8B73"/>
+  <text x="352" y="190" text-anchor="middle" class="box-title">2 · Pick the store</text>
+  <text x="352" y="210" text-anchor="middle" class="box-text">chat: the store tag on the</text>
+  <text x="352" y="228" text-anchor="middle" class="box-text">product, cart or checkout</text>
+  <text x="352" y="246" text-anchor="middle" class="box-text">direct: ?merchant=&lt;id&gt;</text>
+  <text x="352" y="264" text-anchor="middle" class="box-text">(default pier1) · 404 / 503</text>
+
+  <rect x="468" y="168" width="196" height="120" rx="6" fill="#E4DAF7" stroke="#6B4FBB"/>
+  <text x="566" y="190" text-anchor="middle" class="box-title">3 · Buyer context</text>
+  <text x="566" y="210" text-anchor="middle" class="box-text">context from the profile:</text>
+  <text x="566" y="228" text-anchor="middle" class="box-text">currency, country, language</text>
+  <text x="566" y="246" text-anchor="middle" class="box-text">signals: buyer IP, user agent</text>
+  <text x="566" y="264" text-anchor="middle" class="box-text">(chat only; never stored)</text>
+
+  <rect x="682" y="168" width="196" height="120" rx="6" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="780" y="190" text-anchor="middle" class="box-title">4 · meta envelope</text>
+  <text x="780" y="210" text-anchor="middle" class="box-text">meta.ucp-agent.profile =</text>
+  <text x="780" y="228" text-anchor="middle" class="box-text">&lt;public_url&gt;/profile.json</text>
+  <text x="780" y="246" text-anchor="middle" class="box-text">+ idempotency-key (new UUID)</text>
+  <text x="780" y="264" text-anchor="middle" class="box-text">for the cancel / complete tools</text>
+
+  <rect x="896" y="168" width="196" height="120" rx="6" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="994" y="190" text-anchor="middle" class="box-title">5 · Call the store</text>
+  <text x="994" y="210" text-anchor="middle" class="box-text">Client(merchant.endpoint)</text>
+  <text x="994" y="228" text-anchor="middle" class="box-text">.call_tool(tool, args)</text>
+  <text x="994" y="246" text-anchor="middle" class="box-text">JSON-RPC tools/call</text>
+  <text x="994" y="264" text-anchor="middle" class="box-text">endpoint from /.well-known/ucp</text>
+
+  <rect x="1110" y="168" width="196" height="120" rx="6" fill="#fff" stroke="#555"/>
+  <text x="1208" y="190" text-anchor="middle" class="box-title">6 · Parse</text>
+  <text x="1208" y="210" text-anchor="middle" class="box-text">structuredContent first,</text>
+  <text x="1208" y="228" text-anchor="middle" class="box-text">else the TextContent JSON</text>
+  <text x="1208" y="246" text-anchor="middle" class="box-text">UCP business errors (e.g.</text>
+  <text x="1208" y="264" text-anchor="middle" class="box-text">not found) stay UCP bodies</text>
+
+  <rect x="1324" y="168" width="196" height="120" rx="6" fill="#fff" stroke="#555"/>
+  <text x="1422" y="190" text-anchor="middle" class="box-title">7 · Log</text>
+  <text x="1422" y="210" text-anchor="middle" class="box-text">log_exchange(): store, tool,</text>
+  <text x="1422" y="228" text-anchor="middle" class="box-text">timing, request, response</text>
+  <text x="1422" y="246" text-anchor="middle" class="box-text">→ GET /api/exchanges</text>
+  <text x="1422" y="264" text-anchor="middle" class="box-text">transport failure → HTTP 502</text>
+
+  <rect x="1538" y="168" width="196" height="120" rx="6" fill="#fff" stroke="#555"/>
+  <text x="1636" y="190" text-anchor="middle" class="box-title">8 · Return</text>
+  <text x="1636" y="210" text-anchor="middle" class="box-text">chat: blocks for the UI</text>
+  <text x="1636" y="228" text-anchor="middle" class="box-text">(cards, notices, text)</text>
+  <text x="1636" y="246" text-anchor="middle" class="box-text">direct: the UCP body; UCP</text>
+  <text x="1636" y="264" text-anchor="middle" class="box-text">errors → 404 / 422</text>
+
+  <line x1="236" y1="228" x2="252" y2="228" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="450" y1="228" x2="466" y2="228" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="664" y1="228" x2="680" y2="228" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="878" y1="228" x2="894" y2="228" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="1092" y1="228" x2="1108" y2="228" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="1306" y1="228" x2="1322" y2="228" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="1520" y1="228" x2="1536" y2="228" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <text x="34" y="308" class="note">Failures are isolated per store: when several stores are searched, one store's failure becomes a notice and the other stores' results still come back.</text>
+
+  <!-- Panel B: checkout flow -->
+  <rect x="20" y="350" width="1100" height="360" rx="6" fill="#EEF2FC" stroke="#3B5BDB"/>
+  <text x="34" y="372" class="group" fill="#2B4AC4">Checkout flow — one store at a time (each store owns its cart, checkout and payment)</text>
+
+  <rect x="40" y="400" width="190" height="120" rx="6" fill="#DCE3FA" stroke="#3B5BDB"/>
+  <text x="135" y="422" text-anchor="middle" class="box-title">Carts per store</text>
+  <text x="135" y="442" text-anchor="middle" class="box-text">session.carts:</text>
+  <text x="135" y="460" text-anchor="middle" class="box-text">{merchant id → cart}</text>
+  <text x="135" y="478" text-anchor="middle" class="box-text">start_checkout(store) asks</text>
+  <text x="135" y="496" text-anchor="middle" class="box-text">which store if several</text>
+
+  <rect x="258" y="400" width="190" height="120" rx="6" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="353" y="422" text-anchor="middle" class="box-title">create_checkout</text>
+  <text x="353" y="442" text-anchor="middle" class="box-text">cart_id of that store's cart</text>
+  <text x="353" y="460" text-anchor="middle" class="box-text">→ status: incomplete</text>
+  <text x="353" y="478" text-anchor="middle" class="box-text">session.checkout_store</text>
+  <text x="353" y="496" text-anchor="middle" class="box-text">= that store</text>
+
+  <rect x="476" y="400" width="210" height="120" rx="6" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="581" y="422" text-anchor="middle" class="box-title">update_checkout</text>
+  <text x="581" y="442" text-anchor="middle" class="box-text">full replacement every time</text>
+  <text x="581" y="460" text-anchor="middle" class="box-text">buyer (pre-filled from profile)</text>
+  <text x="581" y="478" text-anchor="middle" class="box-text">context + signals</text>
+  <text x="581" y="496" text-anchor="middle" class="box-text">address once name + phone set</text>
+
+  <rect x="714" y="400" width="180" height="120" rx="6" fill="#F7E4C6" stroke="#C77D16"/>
+  <text x="804" y="422" text-anchor="middle" class="box-title">Delivery option</text>
+  <text x="804" y="442" text-anchor="middle" class="box-text">store returns its options</text>
+  <text x="804" y="460" text-anchor="middle" class="box-text">choose_delivery_option</text>
+  <text x="804" y="478" text-anchor="middle" class="box-text">→ update_checkout with</text>
+  <text x="804" y="496" text-anchor="middle" class="box-text">selected_option_id</text>
+
+  <rect x="922" y="400" width="178" height="120" rx="6" fill="#fff" stroke="#999" stroke-dasharray="5 4"/>
+  <text x="1011" y="422" text-anchor="middle" class="box-title">Review — stop</text>
+  <text x="1011" y="442" text-anchor="middle" class="box-text">details complete</text>
+  <text x="1011" y="460" text-anchor="middle" class="box-text">payment switched off:</text>
+  <text x="1011" y="478" text-anchor="middle" class="box-text">complete_checkout</text>
+  <text x="1011" y="496" text-anchor="middle" class="box-text">is never called</text>
+
+  <line x1="230" y1="460" x2="256" y2="460" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="448" y1="460" x2="474" y2="460" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="686" y1="460" x2="712" y2="460" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="894" y1="460" x2="920" y2="460" stroke="#999" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrow-gray)"/>
+
+  <rect x="40" y="540" width="190" height="76" rx="6" fill="#fff" stroke="#555" stroke-dasharray="5 4"/>
+  <text x="135" y="561" text-anchor="middle" class="box-title">Direct entry</text>
+  <text x="135" y="580" text-anchor="middle" class="box-text">/api/mcp/checkout/create</text>
+  <text x="135" y="598" text-anchor="middle" class="box-text">with line_items instead</text>
+  <path d="M230,578 H353 V523" fill="none" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <rect x="400" y="540" width="700" height="150" rx="6" fill="#fff" stroke="#555"/>
+  <text x="416" y="562" class="box-title">Rules the client enforces</text>
+  <text x="416" y="584" class="box-text">• One checkout open at a time: starting one at another store is refused until it is finished or cancelled.</text>
+  <text x="416" y="604" class="box-text">• Changing a store's cart closes that store's open checkout; the next checkout starts from the new cart.</text>
+  <text x="416" y="624" class="box-text">• A cart or checkout the store reports as not found is dropped; the next add starts a new cart.</text>
+  <text x="416" y="644" class="box-text">• A shipping address country overrides the profile's country in the checkout context.</text>
+  <text x="416" y="664" class="box-text">• cancel_checkout also drops the cart when the store closed it together with the checkout.</text>
+
+  <!-- Panel C: lifecycle -->
+  <rect x="1140" y="350" width="640" height="360" rx="6" fill="#F7F7F7" stroke="#888"/>
+  <text x="1154" y="372" class="group" fill="#333">Checkout status lifecycle (UCP spec) — where this client stops</text>
+
+  <rect x="1170" y="400" width="200" height="40" rx="18" fill="#EEF0F3" stroke="#555"/>
+  <text x="1270" y="425" text-anchor="middle" class="box-title">incomplete</text>
+  <rect x="1540" y="400" width="200" height="40" rx="18" fill="#D3EFE5" stroke="#2E8B73" stroke-width="2"/>
+  <text x="1640" y="425" text-anchor="middle" class="box-title">ready_for_complete</text>
+  <rect x="1170" y="500" width="200" height="40" rx="18" fill="#EEF0F3" stroke="#555"/>
+  <text x="1270" y="525" text-anchor="middle" class="box-title">requires_escalation</text>
+  <rect x="1540" y="500" width="200" height="40" rx="18" fill="#fff" stroke="#999" stroke-dasharray="5 4"/>
+  <text x="1640" y="525" text-anchor="middle" class="box-title" fill="#777">complete_in_progress</text>
+  <rect x="1540" y="600" width="200" height="40" rx="18" fill="#fff" stroke="#999" stroke-dasharray="5 4"/>
+  <text x="1640" y="625" text-anchor="middle" class="box-title" fill="#777">completed</text>
+  <rect x="1170" y="600" width="200" height="40" rx="18" fill="#FBE5E5" stroke="#B23A3A"/>
+  <text x="1270" y="625" text-anchor="middle" class="box-title">canceled</text>
+
+  <line x1="1370" y1="420" x2="1537" y2="420" stroke="#555" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <text x="1454" y="412" text-anchor="middle" class="label">all info collected</text>
+
+  <line x1="1240" y1="443" x2="1240" y2="497" stroke="#555" stroke-width="1.4" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text x="1250" y="466" class="label">buyer input needed</text>
+  <text x="1250" y="481" class="label">(continue_url hand-off off)</text>
+
+  <line x1="1640" y1="440" x2="1640" y2="497" stroke="#999" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrow-gray)"/>
+  <text x="1650" y="474" class="label">complete_checkout (off)</text>
+  <line x1="1640" y1="540" x2="1640" y2="597" stroke="#999" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrow-gray)"/>
+  <text x="1650" y="574" class="label">order placed</text>
+
+  <line x1="1240" y1="540" x2="1240" y2="597" stroke="#B23A3A" stroke-width="1.4" marker-end="url(#arrow-red)"/>
+  <text x="1250" y="574" class="label" fill="#8E2C2C">cancel_checkout</text>
+  <path d="M1170,420 H1156 V620 H1167" fill="none" stroke="#B23A3A" stroke-width="1.4" marker-end="url(#arrow-red)"/>
+  <path d="M1560,440 V470 H1440 V620 H1373" fill="none" stroke="#B23A3A" stroke-width="1.4" marker-end="url(#arrow-red)"/>
+  <text x="1448" y="562" class="label" fill="#8E2C2C">cancel from any open state</text>
+
+  <text x="1154" y="666" class="note">This client stops at ready_for_complete, because payment is off. Pier 1 checkouts stay in</text>
+  <text x="1154" y="682" class="note">requires_escalation (extension_interaction_required): a checkout extension on the store needs</text>
+  <text x="1154" y="698" class="note">the buyer on the store's own page, which would be the continue_url hand-off.</text>
+
+  <!-- Panel D: MCP envelope -->
+  <rect x="20" y="740" width="860" height="310" rx="6" fill="#FFFBEA" stroke="#C9B44A"/>
+  <text x="34" y="762" class="group" fill="#7A6A12">MCP arguments sent on every call</text>
+  <text x="40" y="792" class="mono" xml:space="preserve">{</text>
+  <text x="40" y="810" class="mono" xml:space="preserve">  "meta": {</text>
+  <text x="40" y="828" class="mono" xml:space="preserve">    "ucp-agent": { "profile": "&lt;public_url&gt;/profile.json" },</text>
+  <text x="40" y="846" class="mono" xml:space="preserve">    "idempotency-key": "&lt;uuid&gt;"   <tspan class="comment">// cancel_cart, complete_checkout, cancel_checkout only</tspan></text>
+  <text x="40" y="864" class="mono" xml:space="preserve">  },</text>
+  <text x="40" y="882" class="comment" xml:space="preserve">  // then the tool's own arguments, one of:</text>
+  <text x="40" y="900" class="mono" xml:space="preserve">  "catalog":  { "query" | "ids" | "id", "filters", "pagination", "context", "signals" },</text>
+  <text x="40" y="918" class="mono" xml:space="preserve">  "cart":     { "line_items", "context", "signals" },   <tspan class="comment">// update_cart adds "id"</tspan></text>
+  <text x="40" y="936" class="mono" xml:space="preserve">  "checkout": { "cart_id", "line_items": [] },          <tspan class="comment">// create_checkout from a cart</tspan></text>
+  <text x="40" y="954" class="mono" xml:space="preserve">  "checkout": { "line_items", "buyer", "context", "signals", "fulfillment" },</text>
+  <text x="40" y="972" class="comment" xml:space="preserve">              // update_checkout, with "id"; a full replacement every time</text>
+  <text x="40" y="990" class="mono" xml:space="preserve">  "id": "&lt;cart or checkout id&gt;"   <tspan class="comment">// get_* and cancel_*</tspan></text>
+  <text x="40" y="1008" class="mono" xml:space="preserve">}</text>
+  <text x="34" y="1036" class="note">context and signals come from the chat session; the direct /api/mcp/* endpoints pass their request bodies through as given.</text>
+
+  <!-- Panel E: endpoint table -->
+  <rect x="900" y="740" width="880" height="310" rx="6" fill="#FFFBEA" stroke="#C9B44A"/>
+  <text x="914" y="762" class="group" fill="#7A6A12">Direct endpoints → MCP tool (every endpoint takes ?merchant=&lt;id&gt;, default pier1)</text>
+  <text x="916" y="788" class="mono-head">POST /api/mcp/…</text>
+  <text x="1156" y="788" class="mono-head">MCP tool</text>
+  <text x="1306" y="788" class="mono-head">arguments</text>
+  <text x="1586" y="788" class="mono-head">idempotency-key</text>
+
+  <text x="916" y="806" class="mono">/catalog/search/</text><text x="1156" y="806" class="mono">search_catalog</text><text x="1306" y="806" class="mono">catalog.query</text><text x="1586" y="806" class="mono">–</text>
+  <text x="916" y="822" class="mono">/catalog/lookup</text><text x="1156" y="822" class="mono">lookup_catalog</text><text x="1306" y="822" class="mono">catalog.ids</text><text x="1586" y="822" class="mono">–</text>
+  <text x="916" y="838" class="mono">/catalog/product</text><text x="1156" y="838" class="mono">get_product</text><text x="1306" y="838" class="mono">catalog.id</text><text x="1586" y="838" class="mono">–</text>
+  <text x="916" y="854" class="mono">/cart/create</text><text x="1156" y="854" class="mono">create_cart</text><text x="1306" y="854" class="mono">cart</text><text x="1586" y="854" class="mono">–</text>
+  <text x="916" y="870" class="mono">/cart/get</text><text x="1156" y="870" class="mono">get_cart</text><text x="1306" y="870" class="mono">id</text><text x="1586" y="870" class="mono">–</text>
+  <text x="916" y="886" class="mono">/cart/update</text><text x="1156" y="886" class="mono">update_cart</text><text x="1306" y="886" class="mono">id + cart</text><text x="1586" y="886" class="mono">–</text>
+  <text x="916" y="902" class="mono">/cart/cancel</text><text x="1156" y="902" class="mono">cancel_cart</text><text x="1306" y="902" class="mono">id</text><text x="1586" y="902" class="mono">yes</text>
+  <text x="916" y="918" class="mono">/checkout/create</text><text x="1156" y="918" class="mono">create_checkout</text><text x="1306" y="918" class="mono">checkout (cart_id | line_items)</text><text x="1586" y="918" class="mono">–</text>
+  <text x="916" y="934" class="mono">/checkout/get</text><text x="1156" y="934" class="mono">get_checkout</text><text x="1306" y="934" class="mono">id</text><text x="1586" y="934" class="mono">–</text>
+  <text x="916" y="950" class="mono">/checkout/update</text><text x="1156" y="950" class="mono">update_checkout</text><text x="1306" y="950" class="mono">id + checkout</text><text x="1586" y="950" class="mono">–</text>
+  <text x="916" y="966" class="mono">/checkout/cancel</text><text x="1156" y="966" class="mono">cancel_checkout</text><text x="1306" y="966" class="mono">id</text><text x="1586" y="966" class="mono">yes</text>
+  <text x="916" y="982" class="comment">/checkout/complete</text><text x="1156" y="982" class="comment">complete_checkout</text><text x="1306" y="982" class="comment">switched off (commented out)</text><text x="1586" y="982" class="comment">(yes)</text>
+
+  <text x="914" y="1004" class="note">Chat: POST /api/chat and /api/checkout/details → agent.py → shop.py → the same call_mcp pattern.</text>
+  <text x="914" y="1020" class="note">Discovery: GET /profile.json (our platform profile) · GET /api/merchants · GET /api/health · GET /api/exchanges.</text>
+  <text x="914" y="1036" class="note">Errors: unknown store 404 · unavailable store 503 · UCP error 404 (not found) or 422 · transport failure 502.</text>
+</svg>
