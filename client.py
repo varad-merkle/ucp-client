@@ -48,6 +48,7 @@ from ucp_sdk.models.schemas.shopping.checkout_update_request import CheckoutUpda
 from ucp_sdk.models.schemas.shopping.types.line_item_create_request import LineItemCreateRequest
 
 from agent import Agent
+from merchant_config import MERCHANTS
 from shop import Shop
 
 load_dotenv()
@@ -61,11 +62,10 @@ for noisy in ("pyngrok", "httpx", "httpx2", "mcp"):
 
 PORT = 7000
 PROFILE_PATH = Path(__file__).parent / "profile.json"
-STORE_NAME = "Pier 1"
+STORE_NAME = "Universal Commerce Agent "
 STORE_CURRENCY = "USD"
 STORE_COUNTRY = "US"  # prices carts in USD, like the catalog
 # The business we shop from. Its MCP endpoint is read from its /.well-known/ucp on startup.
-BUSINESS_BASE_URL = "https://www.pier1.com"
 
 TOOL_CAPABILITIES = {
     "search_catalog": "dev.ucp.shopping.catalog.search",
@@ -85,9 +85,10 @@ TOOL_CAPABILITIES = {
 # The UCP spec requires meta.idempotency-key for these tools.
 IDEMPOTENT_TOOLS = {"cancel_cart", "complete_checkout", "cancel_checkout"}
 
-# Set on startup: our public URL (ngrok) and the business's MCP endpoint.
+# Set on startup: our public URL (ngrok) and each merchant's MCP endpoint.
 public_url: str | None = None
-MCP_CLIENT_URL: str | None = None
+DEFAULT_MERCHANT_ID = MERCHANTS[0]["merchant_id"]
+MCP_REGISTRY: dict[int, str] = {}
 
 # Recent calls to the store, newest first, for the frontend's protocol log.
 exchanges: list[dict] = []
@@ -96,25 +97,27 @@ MAX_EXCHANGES = 200
 # The business profile, cached as UCP recommends (at least 60 seconds, or the
 # profile's own Cache-Control max-age if longer).
 MIN_PROFILE_TTL = 60
-profile_cache: dict = {"profile": None, "expires": 0.0}
+profile_cache: dict[str, dict] = {}
 
 
 # ----------------------------------------------------------- discovery
 
 
-async def fetch_business_profile() -> dict:
-    if profile_cache["profile"] and time.monotonic() < profile_cache["expires"]:
-        return profile_cache["profile"]
-
+async def fetch_business_profile(merchant_url: str | None = None) -> dict:
+    merchant_url = merchant_url or MERCHANTS[0]["url"]
+    cached = profile_cache.get(merchant_url)
+    if cached and time.monotonic() < cached["expires"]:
+        return cached["profile"]
+    
     # UCP: platforms must not follow redirects when fetching a business profile.
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as http:
-        resp = await http.get(f"{BUSINESS_BASE_URL}/.well-known/ucp", headers={"Accept": "application/json"})
+        profile_url = f"{merchant_url.rstrip('/')}/.well-known/ucp"
+        resp = await http.get(profile_url, headers={"Accept": "application/json"})
         resp.raise_for_status()
         profile = resp.json()
-
     max_age = re.search(r"max-age=(\d+)", resp.headers.get("cache-control", ""))
     ttl = max(MIN_PROFILE_TTL, int(max_age[1]) if max_age else 0)
-    profile_cache.update(profile=profile, expires=time.monotonic() + ttl)
+    profile_cache[merchant_url] = {"profile": profile, "expires": time.monotonic() + ttl}
     return profile
 
 
@@ -130,7 +133,7 @@ def extract_mcp_endpoint(business_profile: dict) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global public_url, MCP_CLIENT_URL
+    global public_url
 
     # 1. Start the tunnel, so the store can fetch our profile.
     try:
@@ -143,10 +146,16 @@ async def lifespan(app: FastAPI):
     public_url = ngrok_tunnel.public_url
     logger.info(f"Public profile URL: {public_url}/profile.json")
 
-    # 2. Fetch the business's profile and find its MCP endpoint.
-    MCP_CLIENT_URL = extract_mcp_endpoint(await fetch_business_profile())
-    logger.info(f"Store: {STORE_NAME}, discovered MCP endpoint: {MCP_CLIENT_URL}")
-    logger.info(f"Ready on http://localhost:{PORT} - start the frontend and open http://localhost:5173")
+    # 2. Discover each merchant's MCP endpoint from its UCP profile.
+    for merchant in MERCHANTS:
+        merchant_id = merchant["merchant_id"]
+        try:
+            profile = await fetch_business_profile(merchant["url"])
+            MCP_REGISTRY[merchant_id] = extract_mcp_endpoint(profile)
+            logger.info(f"Merchant {merchant['name']} ({merchant_id}): discovered MCP endpoint "
+                        f"{MCP_REGISTRY[merchant_id]}")
+        except Exception as exc:
+            logger.warning(f"Merchant {merchant['name']} ({merchant_id}) discovery failed: {exc}")
 
     yield
     ngrok.disconnect(ngrok_tunnel.public_url)
@@ -195,12 +204,16 @@ def summarize(response: dict) -> str:
     return ", ".join(parts) or "empty response"
 
 
-def log_exchange(tool: str, arguments: dict, started: float, status: int, response=None, error=None):
+def log_exchange(tool: str, arguments: dict, started: float, status: int,
+                 merchant_id: int, endpoint: str, response=None, error=None):
+    merchant = next((item for item in MERCHANTS if item["merchant_id"] == merchant_id), {})
     exchanges.insert(0, {
         "id": str(uuid.uuid4()),
         "capability": TOOL_CAPABILITIES.get(tool, "discovery"),
         "method": tool,
-        "url": MCP_CLIENT_URL,
+        "url": endpoint,
+        "merchant_id": merchant_id,
+        "merchant_name": merchant.get("name"),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
         "ok": error is None and (response or {}).get("ucp", {}).get("status") != "error",
@@ -213,21 +226,28 @@ def log_exchange(tool: str, arguments: dict, started: float, status: int, respon
     del exchanges[MAX_EXCHANGES:]
 
 
-async def call_mcp(tool: str, arguments: dict) -> dict:
+async def call_mcp(tool: str, arguments: dict, merchant_id: int = DEFAULT_MERCHANT_ID) -> dict:
     """
     Call one of the store's UCP MCP tools and return its JSON result.
     `arguments` are the tool's own parameters; the `meta` block is added here,
     with an idempotency key for the tools whose spec requires one.
     """
+    endpoint = MCP_REGISTRY.get(merchant_id)
+    if not endpoint:
+        raise HTTPException(status_code=503, detail=f"Merchant {merchant_id} has no discovered MCP endpoint")
+
     meta: dict = {"ucp-agent": {"profile": f"{public_url}/profile.json"}}
     if tool in IDEMPOTENT_TOOLS:
         meta["idempotency-key"] = str(uuid.uuid4())
     arguments = {"meta": meta, **arguments}
 
-    logger.info(f"  -> {tool} {json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
+    merchant = next((item for item in MERCHANTS if item["merchant_id"] == merchant_id), {})
+    merchant_label = f"{merchant.get('name', 'unknown')} ({merchant_id})"
+    logger.info(f"  -> {tool} merchant={merchant_label} endpoint={endpoint} "
+                f"{json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
     started = time.perf_counter()
     try:
-        async with Client(MCP_CLIENT_URL) as mcp_client:
+        async with Client(endpoint) as mcp_client:
             result = await mcp_client.call_tool(tool, arguments)
         text = next((block.text for block in result.content if isinstance(block, TextContent)), "")
         # UCP returns its response in structuredContent; the text block is the same data as JSON.
@@ -241,19 +261,19 @@ async def call_mcp(tool: str, arguments: dict) -> dict:
             raise RuntimeError(text or "the store returned a tool error")
     except Exception as exc:
         message = error_message(exc)
-        logger.error(f"  <- {tool} failed: {message}")
-        log_exchange(tool, arguments, started, 502, error=message)
+        logger.error(f"  <- {tool} failed merchant={merchant_label} endpoint={endpoint}: {message}")
+        log_exchange(tool, arguments, started, 502, merchant_id, endpoint, error=message)
         raise HTTPException(status_code=502, detail=f"{tool} failed: {message}")
-    log_exchange(tool, arguments, started, 200, response)
+    log_exchange(tool, arguments, started, 200, merchant_id, endpoint, response)
     elapsed = round((time.perf_counter() - started) * 1000)
     outcome = "returned an error" if response.get("ucp", {}).get("status") == "error" else "OK"
-    logger.info(f"  <- {tool} {outcome} in {elapsed} ms: {summarize(response)}")
+    logger.info(f"  <- {tool} merchant={merchant_label} {outcome} in {elapsed} ms: {summarize(response)}")
     return response
 
 
-async def call_catalog(tool: str, catalog: dict) -> dict:
+async def call_catalog(tool: str, catalog: dict, merchant_id: int = DEFAULT_MERCHANT_ID) -> dict:
     """Catalog tools take their parameters under `catalog`."""
-    return await call_mcp(tool, {"catalog": catalog})
+    return await call_mcp(tool, {"catalog": catalog}, merchant_id)
 
 
 def check_ucp_status(response: dict, action: str) -> dict:
@@ -269,7 +289,8 @@ def check_ucp_status(response: dict, action: str) -> dict:
     raise HTTPException(status_code=status, detail=detail)
 
 
-shop = Shop(call_catalog, call_mcp, fetch_business_profile, STORE_NAME, STORE_CURRENCY, STORE_COUNTRY)
+shop = Shop(call_catalog, call_mcp, fetch_business_profile, STORE_NAME, STORE_CURRENCY, STORE_COUNTRY,
+            call_merchant_tool=call_catalog)
 agent = Agent(shop)
 
 
@@ -333,11 +354,13 @@ async def checkout_details(body: CheckoutDetailsRequest):
 @app.get("/api/health")
 async def health():
     """Status of this client and of the store it talks to."""
-    store = {"reachable": False, "status": 0, "latency_ms": 0, "name": STORE_NAME}
+    merchant = MERCHANTS[0]
+    merchant_url = merchant["url"]
+    store = {"reachable": False, "status": 0, "latency_ms": 0, "name": merchant["name"]}
     started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-            response = await client.get(f"{BUSINESS_BASE_URL}/.well-known/ucp")
+            response = await client.get(f"{merchant_url.rstrip('/')}/.well-known/ucp")
         store["status"] = response.status_code
         store["reachable"] = response.status_code == 200
     except httpx.HTTPError:
@@ -348,7 +371,7 @@ async def health():
             "status": "ok",
             "version": read_profile()["ucp"]["version"],
             "profile_url": f"{public_url}/profile.json",
-            "merchant_url": BUSINESS_BASE_URL,
+            "merchant_url": merchant_url,
         },
         "merchant": store,
     }

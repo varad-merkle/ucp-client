@@ -7,11 +7,17 @@ product, capabilities, cart, checkout - see ucp-frontend/src/lib/types.ts).
 Payment is not enabled: checkout stops at reviewing the details.
 """
 
+import asyncio
 import html
+import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+
+from merchant_config import MERCHANTS
+
+logger = logging.getLogger("ucp-client")
 
 PAGE_SIZE = 8
 MAX_SESSIONS = 500
@@ -40,6 +46,8 @@ class Session:
     products: list[dict] = field(default_factory=list)  # last products shown, in display order
     last_search: dict | None = None
     next_cursor: str | None = None
+    last_searches: dict[int, dict] = field(default_factory=dict)
+    merchant_cursors: dict[int, str] = field(default_factory=dict)
     detail: dict | None = None  # last product shown in detail
     cart: dict | None = None  # the store's last cart response
     checkout: dict | None = None  # the store's last checkout response
@@ -52,7 +60,6 @@ class Session:
 
 
 # ------------------------------------------------------------------ blocks
-
 
 def text(markdown: str) -> dict:
     return {"type": "text", "text": markdown}
@@ -112,6 +119,10 @@ def product_card(product: dict) -> dict:
             for v in variants
         ],
     }
+    if product.get("merchant_id") is not None:
+        card["merchant_id"] = product["merchant_id"]
+    if product.get("merchant_name"):
+        card["merchant_name"] = product["merchant_name"]
     if featured.get("list_price"):
         card["list_price"] = featured["list_price"]
     if price_range.get("min") and price_range.get("min") != price_range.get("max"):
@@ -313,8 +324,10 @@ def missing_recipient(session: Session) -> list[str]:
 
 class Shop:
     def __init__(self, call_tool: CallTool, call_store_tool: CallTool, fetch_store_profile: FetchProfile,
-                 store_name: str, currency: str, country: str):
+                 store_name: str, currency: str, country: str,
+                 call_merchant_tool: Callable[[str, dict, int], Awaitable[dict]] | None = None):
         self.call_tool = call_tool  # catalog tools: (tool, catalog parameters)
+        self.call_merchant_tool = call_merchant_tool
         self.call_store_tool = call_store_tool  # cart and checkout tools: (tool, tool arguments)
         self.fetch_store_profile = fetch_store_profile
         self.store_name = store_name
@@ -338,21 +351,131 @@ class Shop:
 
     # ------------------------------------------------------------- catalog
 
-    async def search(self, session: Session, query: str | None, low: int | None, high: int | None) -> Blocks:
+    async def _search_merchant(self, merchant: dict, request: dict) -> dict:
+        merchant_id = merchant["merchant_id"]
+        merchant_name = merchant["name"]
+        merchant_request = {**request}
+        logger.info("Catalog search active: merchant=%s (%s) query=%r endpoint selected by registry",
+                    merchant_name, merchant_id, merchant_request.get("query"))
+        try:
+            if self.call_merchant_tool:
+                response = await self.call_merchant_tool("search_catalog", merchant_request, merchant_id)
+            else:
+                response = await self.call_tool("search_catalog", merchant_request)
+            query = merchant_request.get("query")
+            if not response.get("products") and query and (simpler := " ".join(map(singular, query.split()))) != query:
+                merchant_request = {**merchant_request, "query": simpler}
+                logger.info("Retrying catalog search for merchant=%s (%s) with simplified query=%r",
+                            merchant_name, merchant_id, simpler)
+                if self.call_merchant_tool:
+                    response = await self.call_merchant_tool("search_catalog", merchant_request, merchant_id)
+                else:
+                    response = await self.call_tool("search_catalog", merchant_request)
+            products = within_price(response.get("products") or [],
+                                    (merchant_request.get("filters") or {}).get("price"))
+            products = [{**product, "merchant_id": merchant_id, "merchant_name": merchant_name}
+                        for product in products]
+            pagination = response.get("pagination") or {}
+            logger.info("Catalog search result: merchant=%s (%s) products=%s has_more=%s",
+                        merchant_name, merchant_id, len(products), pagination.get("has_next_page", False))
+            return {"merchant": merchant, "request": merchant_request, "response": response,
+                    "products": products, "error": None}
+        except Exception as exc:
+            logger.warning("Catalog search failed: merchant=%s (%s): %s", merchant_name, merchant_id, exc)
+            return {"merchant": merchant, "request": merchant_request, "response": {},
+                    "products": [], "error": exc}
+
+    async def search(self, session: Session, query: str | None, low: int | None, high: int | None,
+                     merchant_ids: list[int] | None = None) -> Blocks:
+        merchants_by_id = {merchant["merchant_id"]: merchant for merchant in MERCHANTS}
+        selected_ids = list(dict.fromkeys(merchant_ids if merchant_ids is not None
+                                          else [MERCHANTS[0]["merchant_id"]]))
+        merchants = [merchants_by_id[merchant_id] for merchant_id in selected_ids
+                     if merchant_id in merchants_by_id]
+        if not merchants:
+            return [notice("error", "No merchants were selected for this search.")]
+
         request: dict = {"pagination": {"limit": PAGE_SIZE}, "context": {"currency": self.currency}}
         if query:
             request["query"] = query
         if low is not None or high is not None:
             request["filters"] = {"price": {k: v for k, v in (("min", low), ("max", high)) if v is not None}}
 
-        response = await self.call_tool("search_catalog", request)
-        # Nothing found for "lamps"? Try "lamp".
-        if not response.get("products") and query and (simpler := " ".join(map(singular, query.split()))) != query:
-            request = {**request, "query": simpler}
-            response = await self.call_tool("search_catalog", request)
-        return self.show_results(session, request, response)
+        outcomes = await asyncio.gather(*(self._search_merchant(merchant, request) for merchant in merchants))
+        session.products = []
+        session.last_searches = {}
+        session.merchant_cursors = {}
+        session.last_search = {key: value for key, value in request.items() if key != "pagination"}
+        result_blocks: Blocks = []
+        successful_merchants = 0
+        for outcome in outcomes:
+            merchant = outcome["merchant"]
+            merchant_id = merchant["merchant_id"]
+            if outcome["error"]:
+                result_blocks.append(notice("warning", f"{merchant['name']} search failed: {outcome['error']}"))
+                continue
+            successful_merchants += 1
+            session.products.extend(outcome["products"])
+            session.last_searches[merchant_id] = {
+                key: value for key, value in outcome["request"].items() if key != "pagination"
+            }
+            pagination = outcome["response"].get("pagination") or {}
+            if pagination.get("has_next_page") and pagination.get("cursor"):
+                session.merchant_cursors[merchant_id] = pagination["cursor"]
+            result_blocks.extend(notices(outcome["response"].get("messages")))
+
+        session.next_cursor = "available" if session.merchant_cursors else None
+        logger.info("Aggregated catalog search: merchants_succeeded=%s/%s products=%s",
+                    successful_merchants, len(merchants), len(session.products))
+        if not session.products:
+            return [text("No products matched."), *result_blocks]
+        cards = {"type": "products", "products": [product_card(product) for product in session.products]}
+        found = "1 product" if len(session.products) == 1 else f"{len(session.products)} products"
+        return [text(f"Found {found} across {successful_merchants} merchant(s)."), cards, *result_blocks]
 
     async def more(self, session: Session) -> Blocks:
+        if session.last_searches:
+            merchants_by_id = {merchant["merchant_id"]: merchant for merchant in MERCHANTS}
+            pending = [
+                (merchants_by_id[merchant_id], search, cursor)
+                for merchant_id, search in session.last_searches.items()
+                if (cursor := session.merchant_cursors.get(merchant_id))
+                and merchant_id in merchants_by_id
+            ]
+            if not pending:
+                return [text("There are no more results for the last search.")]
+            outcomes = await asyncio.gather(*(
+                self._search_merchant(merchant, {**search, "pagination": {"limit": PAGE_SIZE, "cursor": cursor}})
+                for merchant, search, cursor in pending
+            ))
+            new_products: list[dict] = []
+            result_blocks: Blocks = []
+            for outcome in outcomes:
+                merchant_id = outcome["merchant"]["merchant_id"]
+                if outcome["error"]:
+                    result_blocks.append(notice("warning", f"{outcome['merchant']['name']} search failed: "
+                                                f"{outcome['error']}"))
+                    session.merchant_cursors.pop(merchant_id, None)
+                    continue
+                new_products.extend(outcome["products"])
+                pagination = outcome["response"].get("pagination") or {}
+                if pagination.get("has_next_page") and pagination.get("cursor"):
+                    session.merchant_cursors[merchant_id] = pagination["cursor"]
+                else:
+                    session.merchant_cursors.pop(merchant_id, None)
+                session.last_searches[merchant_id] = {
+                    key: value for key, value in outcome["request"].items() if key != "pagination"
+                }
+                result_blocks.extend(notices(outcome["response"].get("messages")))
+            session.products.extend(new_products)
+            session.next_cursor = "available" if session.merchant_cursors else None
+            logger.info("Aggregated next page: products=%s remaining_merchants=%s",
+                        len(new_products), sorted(session.merchant_cursors))
+            if not new_products:
+                return [text("No more products were returned."), *result_blocks]
+            found = "1 more product" if len(new_products) == 1 else f"{len(new_products)} more products"
+            cards = {"type": "products", "products": [product_card(product) for product in new_products]}
+            return [text(f"Found {found}."), cards, *result_blocks]
         if not session.last_search or not session.next_cursor:
             return [text("There are no more results for the last search.")]
         request = {**session.last_search, "pagination": {"limit": PAGE_SIZE, "cursor": session.next_cursor}}

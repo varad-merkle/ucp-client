@@ -15,9 +15,8 @@ Configured with the dentsu AI gateway .env structure (see .env.example):
 import json
 import logging
 import os
-
 from openai import AsyncAzureOpenAI, OpenAIError
-
+from merchant_config import MERCHANTS, TAXONOMY_MAP
 from shop import Blocks, Session, Shop, cart_state, delivery_group, dollars, notice, total_of
 
 logger = logging.getLogger("ucp-client")
@@ -29,13 +28,15 @@ GATEWAY_SETTINGS = ["MODEL_ENDPOINT", "api_version", "AZURE_OPENAI_API_KEY", "AP
                     "SERVICE_LINE", "BRAND", "PROJECT"]
 
 INSTRUCTIONS = """\
-You are the shopping assistant for {store}, an online home-decor store. You help shoppers
+You are the shopping assistant for , an online home-decor store. You help shoppers
 find products, manage their cart and fill in checkout details, using the tools provided.
 The tools talk to the store over the Universal Commerce Protocol (UCP).
 
 How to work:
 - Use the tools for every fact about products, prices, stock, the cart and checkout.
   Never invent products, prices, ids or availability.
+- For product searches, include all relevant taxonomy IDs from the search tool; use an
+    empty list if none clearly apply.
 - Use only ids that appear in tool results or in the current state below.
 - Product cards, the cart and the checkout are shown to the shopper automatically
   next to your reply, so don't repeat them item by item. Reply in one to three
@@ -77,10 +78,16 @@ def tool(name: str, description: str, **properties) -> dict:
 
 TEXT_OR_NULL = {"type": ["string", "null"]}
 NUMBER_OR_NULL = {"type": ["number", "null"]}
+TAXONOMY_CHOICES = "; ".join(f"{taxonomy_id}: {name}" for taxonomy_id, name in TAXONOMY_MAP.items())
 
 TOOLS = [
     tool("search_products", "Search the store's catalog. Use plain product words for the query.",
          query={**TEXT_OR_NULL, "description": "What to look for, e.g. 'floor lamp'"},
+         taxonomy_ids={
+             "type": "array",
+             "items": {"type": "integer", "enum": list(TAXONOMY_MAP)},
+             "description": f"Relevant categories: {TAXONOMY_CHOICES}. Return [] if none clearly apply.",
+         },
          min_price_usd=NUMBER_OR_NULL, max_price_usd=NUMBER_OR_NULL),
     tool("show_more_results", "Show the next page of the last search."),
     tool("get_product_details", "Show full details of one product, optionally with an option selected.",
@@ -120,6 +127,8 @@ def product_summary(product: dict) -> dict:
     variants = product.get("variants") or []
     return {
         "product_id": product["id"],
+        "merchant_id": product.get("merchant_id"),
+        "merchant_name": product.get("merchant_name"),
         "title": product["title"],
         "variants": [
             {"variant_id": v["id"], "title": v.get("title"), "price": dollars(v["price"]["amount"]),
@@ -260,8 +269,21 @@ class Agent:
         shop = self.shop
         match name:
             case "search_products":
+                taxonomy_ids = sorted({taxonomy_id for taxonomy_id in args.get("taxonomy_ids", [])
+                                       if taxonomy_id in TAXONOMY_MAP})
+                matched = [merchant for merchant in MERCHANTS
+                           if set(merchant["taxonomy_id"]).intersection(taxonomy_ids)]
+                fallback = not matched
+                if fallback:
+                    matched = MERCHANTS
+                categories = [f"{taxonomy_id}: {TAXONOMY_MAP[taxonomy_id]}" for taxonomy_id in taxonomy_ids]
+                merchant_labels = [f"{merchant['name']} ({merchant['merchant_id']})" for merchant in matched]
+                reason = "; falling back to all merchants" if fallback else ""
+                logger.info("Taxonomy routing: IDs=%s categories=%s -> merchants=%s%s",
+                            taxonomy_ids, categories, merchant_labels, reason)
                 return await shop.search(session, args["query"], cents(args["min_price_usd"]),
-                                         cents(args["max_price_usd"]))
+                                         cents(args["max_price_usd"]),
+                                         [merchant["merchant_id"] for merchant in matched])
             case "show_more_results":
                 return await shop.more(session)
             case "get_product_details":
