@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 
 import auth
 import db
-import identity
 import profile_store
 
 load_dotenv()
@@ -32,7 +31,6 @@ def database(monkeypatch):
     monkeypatch.setattr(db, "SCHEMA", schema)
     auth.init_auth()      # accounts first: a profile references its user
     profile_store.init_db()
-    identity.init_identity()
     auth.create_user(USER, PASSWORD)
     auth.create_user(OTHER_USER, OTHER_PASSWORD)
     yield

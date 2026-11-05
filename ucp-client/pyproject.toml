@@ -3,7 +3,6 @@ name = "ucp-client"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "cryptography>=45",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "mcp[cli]>=2.2.0",

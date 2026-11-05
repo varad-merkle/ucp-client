@@ -19,11 +19,6 @@ preferences are what reach the stores over UCP.
     POST /api/chat                    (auth) one chat turn (agent.py + shop.py)
     POST /api/checkout/details        (auth) the checkout card's delivery details form
     POST /api/checkout/start          (auth) a cart card's Checkout button, for one store
-    GET  /api/identity                (auth) identity linking status: Shop account and each store
-    POST /api/identity/link           (auth) start linking Shop accounts or one store; returns the URL
-    GET  /api/identity/callback       where the authorization server sends the browser back
-    DELETE /api/identity/{target}     (auth) unlink (revokes the tokens first)
-    GET  /oauth/client.json           our OAuth Client ID Metadata Document
     GET  /api/health                  status of this client and the stores
     GET  /api/merchants               the stores, their categories and what discovery found
     GET  /api/exchanges               recent store calls (exchange log)
@@ -39,22 +34,18 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlencode
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 from mcp import Client
-from mcp.client.streamable_http import streamable_http_client
-from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp_types import TextContent
 from pydantic import BaseModel
 from pyngrok import ngrok
@@ -69,7 +60,6 @@ from ucp_sdk.models.schemas.shopping.checkout_update_request import CheckoutUpda
 from ucp_sdk.models.schemas.shopping.types.line_item_create_request import LineItemCreateRequest
 
 import auth
-import identity
 from agent import Agent
 from merchants import Merchant, Registry
 from profile_store import get_profile, init_db, update_profile
@@ -132,7 +122,6 @@ async def lifespan(app: FastAPI):
     #    a buyer profile belongs to a user, so app_user must exist before it.
     auth.init_auth()
     init_db()
-    identity.init_identity()
     logger.info("Buyer profile database ready")
 
     # 2. Start the tunnel, so the store can fetch our profile.
@@ -144,18 +133,12 @@ async def lifespan(app: FastAPI):
             "Could not open the ngrok tunnel. Is client.py already running in another terminal?"
         ) from exc
     public_url = ngrok_tunnel.public_url
-    identity.set_public_url(public_url)
     logger.info(f"Public profile URL: {public_url}/profile.json")
 
     # 3. Read each store's /.well-known/ucp for its MCP endpoint, version and capabilities.
     await registry.discover_all(read_profile())
     available = [m.name for m in registry.all() if not m.error]
     logger.info(f"{len(available)} of {len(registry.all())} stores available: {', '.join(available)}")
-    if identity.enabled(registry.all()):
-        linkable = [m.name for m in registry.all() if identity.linkable(m)]
-        logger.info(f"Identity linking on for: {', '.join(linkable) or 'no store yet'}")
-    else:
-        logger.info("Identity linking off: set IDENTITY_TOKEN_KEY and SHOPIFY_CLIENT_ID/SECRET in .env to turn it on")
     logger.info(f"Ready on http://localhost:{PORT} - start the frontend and open http://localhost:5173")
 
     yield
@@ -206,7 +189,7 @@ def summarize(response: dict) -> str:
 
 
 def log_exchange(merchant: Merchant, tool: str, arguments: dict, started: float, status: int,
-                 response=None, error=None, linked: bool = False):
+                 response=None, error=None):
     exchanges.insert(0, {
         "id": str(uuid.uuid4()),
         "merchant": merchant.id,
@@ -217,9 +200,7 @@ def log_exchange(merchant: Merchant, tool: str, arguments: dict, started: float,
         "status": status,
         "ok": error is None and (response or {}).get("ucp", {}).get("status") != "error",
         "duration_ms": round((time.perf_counter() - started) * 1000),
-        "request_headers": {"UCP-Agent": f'profile="{public_url}/profile.json"',
-                            # The token itself is never logged.
-                            **({"Authorization": "Bearer ***"} if linked else {})},
+        "request_headers": {"UCP-Agent": f'profile="{public_url}/profile.json"'},
         "request_body": arguments,
         "response_body": response,
         "error": error,
@@ -238,18 +219,11 @@ async def call_mcp(merchant: Merchant, tool: str, arguments: dict) -> dict:
         meta["idempotency-key"] = str(uuid.uuid4())
     arguments = {"meta": meta, **arguments}
 
-    # A linked user's calls carry that store's token (identity.py); everyone else is a guest.
-    username = identity.acting_user.get()
-    token = await identity.bearer_for(username, merchant)
-    retried_auth = retried_error = False
-
-    while True:
-        logger.info(f"  -> {merchant.id}.{tool}{' (linked)' if token else ''} "
-                    f"{json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
+    for attempt in (1, 2):
+        logger.info(f"  -> {merchant.id}.{tool} {json.dumps({k: v for k, v in arguments.items() if k != 'meta'})}")
         started = time.perf_counter()
-        challenge: dict = {}
         try:
-            async with _store_client(merchant, token, challenge) as mcp_client:
+            async with Client(merchant.endpoint) as mcp_client:
                 result = await mcp_client.call_tool(tool, arguments)
             text = next((block.text for block in result.content if isinstance(block, TextContent)), "")
             # UCP returns its response in structuredContent; the text block is the same data as JSON.
@@ -265,64 +239,16 @@ async def call_mcp(merchant: Merchant, tool: str, arguments: dict) -> dict:
         except Exception as exc:
             message = error_message(exc)
             logger.error(f"  <- {merchant.id}.{tool} failed: {message}")
-            log_exchange(merchant, tool, arguments, started, challenge.get("status", 502), error=message,
-                         linked=bool(token))
-            if token and challenge.get("status") == 401 and not retried_auth:
-                # identity_required: the token was rejected. Refresh or re-chain once,
-                # and if that gives nothing, carry on as a guest (linking never gates).
-                retried_auth = True
-                identity.invalidate(username, merchant.id)
-                token = await identity.bearer_for(username, merchant)
-                continue
-            if token and challenge.get("status") == 422 and not retried_auth:
-                # Shopify rejects a linked call without a usable buyer IP (e.g. 127.0.0.1
-                # in local development): fall back to a guest call rather than fail.
-                logger.warning(f"  {merchant.name} refused the linked call (HTTP 422); retrying as a guest")
-                retried_auth = True
-                token = None
-                continue
-            if token and challenge.get("status") == 403:
-                identity.note_insufficient_scope(username, merchant.id, challenge.get("www_authenticate"))
-                raise HTTPException(status_code=403, detail=(
-                    f"{merchant.name} needs more permission for {tool}: link your {merchant.name} account again"))
-            if not retried_error and message.strip().lower() in RETRY_ERRORS:
-                retried_error = True
+            log_exchange(merchant, tool, arguments, started, 502, error=message)
+            if attempt == 1 and message.strip().lower() in RETRY_ERRORS:
                 await asyncio.sleep(RETRY_DELAY)
                 continue
             raise HTTPException(status_code=502, detail=f"{merchant.name} {tool} failed: {message}")
-    log_exchange(merchant, tool, arguments, started, 200, response, linked=bool(token))
+    log_exchange(merchant, tool, arguments, started, 200, response)
     elapsed = round((time.perf_counter() - started) * 1000)
     outcome = "returned an error" if response.get("ucp", {}).get("status") == "error" else "OK"
     logger.info(f"  <- {merchant.id}.{tool} {outcome} in {elapsed} ms: {summarize(response)}")
     return response
-
-
-def _store_client(merchant: Merchant, token: str | None, challenge: dict) -> Client:
-    """An MCP client for one store call. Guest calls are unchanged; linked calls send the
-    store's token and record a 401/403 with its WWW-Authenticate challenge (RFC 6750 §3),
-    which the MCP library would otherwise reduce to a generic error."""
-    if not token:
-        return Client(merchant.endpoint)
-
-    async def watch(response):
-        if response.status_code in (401, 403, 422):
-            challenge["status"] = response.status_code
-            challenge["www_authenticate"] = response.headers.get("www-authenticate")
-
-    headers = {"Authorization": f"Bearer {token}"}
-    buyer_ip = identity.acting_buyer_ip.get()
-    if buyer_ip:
-        headers["Shopify-Buyer-IP"] = buyer_ip   # required by Shopify on Token-tier tool calls
-    http = create_mcp_http_client(headers=headers)
-    http.event_hooks["response"].append(watch)
-    return Client(_closing(http, streamable_http_client(merchant.endpoint, http_client=http)))
-
-
-@asynccontextmanager
-async def _closing(http, transport):
-    """A transport that also closes the HTTP client it was given."""
-    async with http, transport as streams:
-        yield streams
 
 
 def merchant_or_404(merchant_id: str) -> Merchant:
@@ -472,61 +398,6 @@ async def patch_buyer_profile(body: ProfilePatch, username: str = Depends(curren
         raise HTTPException(status_code=422, detail=str(exc))
 
 
-# ------------------------------------------------------------ identity linking
-
-
-class LinkRequest(BaseModel):
-    target: str  # "shop" for Shop accounts (links every store that trusts it), or a store id
-
-
-def _frontend(**params) -> str:
-    base = (os.environ.get("FRONTEND_URL") or "http://localhost:5173").rstrip("/")
-    return f"{base}/?{urlencode(params)}"
-
-
-@app.get("/oauth/client.json")
-async def oauth_client_metadata():
-    """Our Client ID Metadata Document, used as client_id where no client is registered."""
-    return JSONResponse(identity.client_metadata(public_url), headers={"Cache-Control": "public, max-age=3600"})
-
-
-@app.get("/api/identity")
-async def identity_status(username: str = Depends(current_user)):
-    return identity.status(username, registry)
-
-
-@app.post("/api/identity/link")
-async def identity_link(body: LinkRequest, username: str = Depends(current_user)):
-    """Start a link. The frontend sends the browser to the returned URL."""
-    if not identity.enabled(registry.all()):
-        raise HTTPException(status_code=409, detail="Identity linking is not configured on this server")
-    if body.target != identity.SHOP and not registry.get(body.target):
-        raise HTTPException(status_code=404, detail=f"Unknown store {body.target}")
-    try:
-        return {"authorize_url": await identity.start_link(username, body.target, registry)}
-    except identity.IdentityError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-
-
-@app.get("/api/identity/callback")
-async def identity_callback(state: str | None = None, code: str | None = None,
-                            iss: str | None = None, error: str | None = None):
-    """The authorization server sends the browser here. No login token arrives with it:
-    the user is the one the single-use `state` was issued to."""
-    try:
-        _, target = await identity.finish_link(state, code, iss, error, registry)
-    except identity.IdentityError as exc:
-        logger.warning(f"Identity: link failed: {exc}")
-        return RedirectResponse(_frontend(identity="error", reason=str(exc)), status_code=303)
-    return RedirectResponse(_frontend(identity="linked", target=target), status_code=303)
-
-
-@app.delete("/api/identity/{target}")
-async def identity_unlink(target: str, username: str = Depends(current_user)):
-    await identity.unlink(username, target)
-    return identity.status(username, registry)
-
-
 # ------------------------------------------------------------ chat
 
 
@@ -551,12 +422,6 @@ def _extract_signals(request: Request) -> dict:
     return signals
 
 
-def _act_for(username: str, request: Request) -> None:
-    """Store calls made while handling this request act for this user (identity.py)."""
-    identity.acting_user.set(username)
-    identity.acting_buyer_ip.set(request.client.host if request.client else None)
-
-
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
@@ -566,7 +431,6 @@ class ChatRequest(BaseModel):
 async def chat_turn(body: ChatRequest, request: Request, username: str = Depends(current_user)):
     """One chat turn: the reply is a list of blocks the frontend renders."""
     logger.info(f"Chat [{username}]: {body.message!r}")
-    _act_for(username, request)
     signals = _extract_signals(request)
     reply = await agent.reply(body.message, body.session_id, username, signals)
     logger.info(f"Reply: {', '.join(block['type'] for block in reply['blocks'])}")
@@ -595,7 +459,6 @@ async def checkout_details(body: CheckoutDetailsRequest, request: Request,
                            username: str = Depends(current_user)):
     """The checkout card's delivery details form: saved on the checkout in one update."""
     logger.info(f"Chat [{username}]: delivery details form submitted")
-    _act_for(username, request)
     details = {k: (v.strip() or None) if isinstance(v, str) else v for k, v in body.details.model_dump().items()}
     signals = _extract_signals(request)
     return await agent.submit_details(body.session_id, details, username, signals)
@@ -613,7 +476,6 @@ async def start_checkout(body: StartCheckoutRequest, request: Request,
     if not registry.get(body.store):
         raise HTTPException(status_code=404, detail=f"Unknown store {body.store}")
     logger.info(f"Chat [{username}]: checkout button pressed for {body.store}")
-    _act_for(username, request)
     reply = await agent.start_checkout(body.session_id, body.store, username, _extract_signals(request))
     logger.info(f"Reply: {', '.join(block['type'] for block in reply['blocks'])}")
     return reply

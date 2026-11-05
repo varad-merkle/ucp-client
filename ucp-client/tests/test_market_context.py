@@ -10,8 +10,56 @@ def make_shop():
     return Shop(Registry(), call_tool=None)
 
 
+def make_country_shop(merchants):
+    registry = Registry()
+    registry.merchants = {merchant.id: merchant for merchant in merchants}
+    registry.categories = sorted({category for merchant in merchants for category in merchant.categories})
+    return Shop(registry, call_tool=None)
+
+
 def test_no_context_when_profile_is_empty():
     assert make_shop()._market_context(USER) == {}
+
+
+def test_registry_loads_merchant_supported_countries():
+    registry = Registry()
+
+    assert registry.get("allbirds").supported_countries == ["US"]
+
+
+def test_stores_for_only_returns_merchants_supporting_country():
+    supported = Merchant("supported", "Supported", "https://supported.test", ["furniture"],
+                         supported_countries=["US"], capabilities={SEARCH})
+    unsupported = Merchant("unsupported", "Unsupported", "https://unsupported.test", ["furniture"],
+                           supported_countries=["CA"], capabilities={SEARCH})
+    shop = make_country_shop([supported, unsupported])
+
+    stores, _ = shop.stores_for(["furniture"], "us")
+
+    assert [store.id for store in stores] == ["supported"]
+
+
+def test_stores_for_returns_empty_when_no_merchant_supports_country():
+    unsupported = Merchant("unsupported", "Unsupported", "https://unsupported.test", ["furniture"],
+                           supported_countries=["CA"], capabilities={SEARCH})
+    shop = make_country_shop([unsupported])
+
+    stores, reason = shop.stores_for(["furniture"], "US")
+
+    assert stores == []
+    assert "No merchant is listed as supporting US" in reason
+
+
+def test_stores_for_keeps_all_category_matches_when_country_is_missing():
+    supported = Merchant("supported", "Supported", "https://supported.test", ["furniture"],
+                         supported_countries=["US"], capabilities={SEARCH})
+    unsupported = Merchant("unsupported", "Unsupported", "https://unsupported.test", ["furniture"],
+                           supported_countries=["CA"], capabilities={SEARCH})
+    shop = make_country_shop([supported, unsupported])
+
+    stores, _ = shop.stores_for(["furniture"])
+
+    assert [store.id for store in stores] == ["supported", "unsupported"]
 
 
 def test_market_preferences_map_to_ucp_context():

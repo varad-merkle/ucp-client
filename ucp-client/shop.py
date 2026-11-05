@@ -59,7 +59,6 @@ class Search:
     stores: list[Merchant]
     why: str  # which stores were searched and why, for the model
     next_cursors: dict[str, str] = field(default_factory=dict)  # merchant id -> next page cursor
-    found: list[dict] = field(default_factory=list)  # products this search last showed
 
 
 @dataclass
@@ -276,24 +275,8 @@ def checkout_messages(checkout: dict, address_sent: bool, store: str | None = No
     return shown
 
 
-# Severities meaning only the buyer can resolve the message, on the store's own page (UCP).
-BUYER_ONLY = {"requires_buyer_input", "requires_buyer_review"}
-
-
-def store_checkout_url(checkout: dict) -> str | None:
-    """The store's own checkout page (UCP continue_url), where payment and placing the order happen.
-
-    Every store takes the same path: once nothing fixable is left, the shopper continues
-    there, whether the store says ready_for_complete (e.g. Auto-Xpert) or
-    requires_escalation (e.g. Pier 1, whose checkout extension needs a click). Only an
-    https link is passed on, so a store can't put a script link on the card.
-    """
-    url = checkout.get("continue_url") or ""
-    return url if url.startswith("https://") else None
-
-
 def checkout_block(checkout: dict, given: dict | None = None, store: str | None = None,
-                   address_sent: bool = True, continue_url: str | None = None) -> dict:
+                   address_sent: bool = True) -> dict:
     """
     A UCP checkout as the frontend's checkout card. `given` holds the buyer and address
     details the shopper entered, to pre-fill the card's delivery details form.
@@ -345,8 +328,8 @@ def checkout_block(checkout: dict, given: dict | None = None, store: str | None 
                 "postal_code": given.get("postal_code", ""),
                 "country": given.get("address_country", ""),
             },
-            # The store's checkout page, set only once nothing fixable is left (see checkout_reply).
-            "continue_url": continue_url,
+            # Payment is switched off for now, so the store's payment page link isn't passed on.
+            # "continue_url": checkout.get("continue_url"),
         },
     }
 
@@ -473,33 +456,53 @@ class Shop:
 
     # ------------------------------------------------------------- catalog
 
-    def stores_for(self, categories: list[str] | None) -> tuple[list[Merchant], str]:
+    @staticmethod
+    def _log_country_priority(country: str | None, merchants: list[Merchant]) -> None:
+        country_code = country.upper() if country else None
+        supported = [m.id for m in merchants if country_code and country_code in m.supported_countries]
+        logger.info(
+            "Location personalization: buyer_country=%s, country_supported=%s, final_search_order=%s",
+            country_code or "not set",
+            supported,
+            [m.id for m in merchants],
+        )
+
+    def stores_for(self, categories: list[str] | None, country: str | None = None) -> tuple[list[Merchant], str]:
         """The stores to search for these categories, and a note saying why, for the model."""
         searchable = [m for m in self.registry.all() if m.supports(SEARCH)]
+        searchable = self.registry.supporting_country(searchable, country)
         wanted = [c for c in categories or [] if c in self.registry.categories][:MAX_CATEGORIES]
         if not wanted:
+            self._log_country_priority(country, searchable)
+            if country and not searchable:
+                return [], f"No merchant is listed as supporting {country}."
             return searchable, "No category was given, so every store was searched."
-        selling = self.registry.selling(wanted)
+        selling = self.registry.selling(wanted, country)
         chosen = [m for m in selling if m.supports(SEARCH)]
         down = [m.name for m in selling if not m.supports(SEARCH)]
         note = f" ({', '.join(down)} also sells this but can't be searched right now.)" if down else ""
         if not chosen:
+            self._log_country_priority(country, searchable)
+            if country and not searchable:
+                return [], f"No merchant is listed as supporting {country}."
+            if country:
+                return searchable, (
+                    f"No available merchant supporting {country} sells {', '.join(wanted)}, "
+                    f"so every available merchant supporting {country} was searched.{note}"
+                )
             return searchable, f"No available store sells {', '.join(wanted)}, so every store was searched.{note}"
+        self._log_country_priority(country, chosen)
         return chosen, f"Searched {', '.join(m.name for m in chosen)} for {', '.join(wanted)}.{note}"
 
-    async def search(self, session: Session, searches: list[dict], add: bool = False) -> Blocks:
+    async def search(self, session: Session, searches: list[dict]) -> Blocks:
         """
         Run one to MAX_SEARCHES searches together, each {query, categories, low, high}.
         Several searches (e.g. shoes and a dining table) are shown side by side.
-
-        add=True keeps the searches already shown in this chat turn: when the model asks
-        for "shoes and a couch" as two calls instead of one, the couch results join the
-        shoes instead of replacing them. Earlier searches are not sent to the stores again.
         """
         ctx = self._market_context(session.username)
-        new: list[Search] = []
+        session.searches = []
         for wanted in searches[:MAX_SEARCHES]:
-            stores, why = self.stores_for(wanted["categories"])
+            stores, why = self.stores_for(wanted["categories"], ctx.get("address_country"))
             logger.info(f"Categories {wanted['categories']} -> {[m.id for m in stores]}: {why}")
             request: dict = {}
             if ctx:
@@ -510,12 +513,8 @@ class Shop:
             if low is not None or high is not None:
                 request["filters"] = {"price": {k: v for k, v in (("min", low), ("max", high)) if v is not None}}
             label = wanted["query"] or ", ".join(wanted["categories"] or []) or "Results"
-            new.append(Search(label, request, stores, why))
-        # Keep earlier searches that found something and aren't being asked again.
-        labels = {s.label.lower() for s in new}
-        earlier = [s for s in session.searches if s.found and s.label.lower() not in labels] if add else []
-        session.searches = earlier + new
-        return await self.run_searches(session, new, earlier=earlier)
+            session.searches.append(Search(label, request, stores, why))
+        return await self.run_searches(session, session.searches)
 
     async def more(self, session: Session) -> Blocks:
         if not session.has_more():
@@ -528,9 +527,8 @@ class Shop:
             search.next_cursors = {}
         return await self.run_searches(session, searches, cursors)
 
-    async def run_searches(self, session: Session, searches: list[Search], cursors: list[dict[str, str]] | None = None,
-                           earlier: list[Search] | None = None) -> Blocks:
-        """Send every search to its stores at once, then show the results (after any earlier ones)."""
+    async def run_searches(self, session: Session, searches: list[Search], cursors: list[dict[str, str]] | None = None) -> Blocks:
+        """Send every search to its stores at once, then show the results."""
         calls = []
         for i, search in enumerate(searches):
             limit = PAGE_SIZE if len(search.stores) == 1 else MIN_PER_STORE
@@ -538,7 +536,7 @@ class Shop:
                 cursor = cursors[i].get(m.id) if cursors else None
                 calls.append(self.search_store(m, search.request, limit, cursor, signals=session.signals or None))
         results = iter(await asyncio.gather(*calls, return_exceptions=True))
-        return self.show_results(session, [(s, [(m, next(results)) for m in s.stores]) for s in searches], earlier)
+        return self.show_results(session, [(s, [(m, next(results)) for m in s.stores]) for s in searches])
 
     async def search_store(self, merchant: Merchant, request: dict, limit: int,
                            cursor: str | None = None, signals: dict | None = None) -> dict:
@@ -576,15 +574,12 @@ class Shop:
         return products, f"{search.why} Results per store: {', '.join(counts) or 'none'}.", problems
 
     def show_results(self, session: Session,
-                     searches: list[tuple[Search, list[tuple[Merchant, dict | BaseException]]]],
-                     earlier: list[Search] | None = None) -> Blocks:
-        groups = [(search, search.found) for search in earlier or []]
-        summaries, problems = [], []
+                     searches: list[tuple[Search, list[tuple[Merchant, dict | BaseException]]]]) -> Blocks:
+        groups, summaries, problems = [], [], []
         for search, results in searches:
             found, summary, found_problems = self.search_results(search, results)
-            search.found = found
             groups.append((search, found))
-            label = f'"{search.label}": {len(found)} products. ' if len(groups) > 1 else ""
+            label = f'"{search.label}": {len(found)} products. ' if len(searches) > 1 else ""
             summaries.append(label + summary)
             problems += found_problems
 
@@ -599,8 +594,8 @@ class Shop:
             # Different things asked for at once: the frontend shows each in its own column.
             cards["groups"] = [
                 {"title": search.label,
-                 "stores": [m.name for m in search.stores],
-                 "products": [product_card(p, self.store_of(p).name) for p in found]}
+                "stores": [m.name for m in search.stores],
+                "products": [product_card(p, self.store_of(p).name) for p in found]}
                 for search, found in groups
             ]
         return [text(f"Found {len(products)} products. {summary}"), cards, *problems]
@@ -899,9 +894,8 @@ class Shop:
             return notices(response.get("messages")) or [notice("error", f"{merchant.name} couldn't open a checkout.")]
 
         session.checkout = response
-        # UCP: "recoverable" errors are fixed here with update_checkout first; then the shopper
-        # continues on the store's own page (continue_url) to pay and place the order. That page
-        # also handles anything only the buyer can do (requires_buyer_input / review).
+        # UCP: "recoverable" errors are fixed with update_checkout. Anything needing the buyer on the
+        # store's own page (requires_buyer_input / review) would go to continue_url, which is switched off.
         # The address is held back until the recipient is complete (see checkout_payload).
         address_sent = bool(session.address) and not missing_recipient(session)
         messages = checkout_messages(response, address_sent, merchant.name)
@@ -911,22 +905,17 @@ class Shop:
         else:
             needed += [f"Recipient {name.replace('_', ' ')}" for name in missing_recipient(session)]
 
-        store_url = None if needed else store_checkout_url(response)
-        blocks = [checkout_block(response, {**session.buyer, **session.address}, merchant.name, address_sent,
-                                 continue_url=store_url)]
+        blocks = [checkout_block(response, {**session.buyer, **session.address}, merchant.name, address_sent)]
         if needed:
             blocks.append(text(f"{merchant.name} still needs: " + "; ".join(needed)))
-        elif store_url:
-            # Hand-off to the store's own payment page (UCP continue_url).
-            steps = [m["content"] for m in messages if m["severity"] in BUYER_ONLY]
-            extra = (f" {merchant.name} also asks the shopper to complete this there: {'; '.join(steps)}"
-                     if steps else "")
-            blocks.append(text(
-                f"Everything that can be filled in here is done. Payment and placing the order happen on "
-                f"{merchant.name}'s own checkout page: "
-                f"[Continue to payment on {merchant.name}]({store_url}).{extra}"
-            ))
         else:
-            blocks.append(text(f"The {merchant.name} checkout details are complete, but {merchant.name} gave "
-                               "no checkout page to continue on, so the order can't be finished from here."))
+            blocks.append(text(f"The {merchant.name} checkout details are complete. "
+                               "Payment isn't enabled, so checkout stops here."))
+        # Hand-off to the store's own payment page (UCP continue_url); uncomment to bring it back.
+        # elif response.get("continue_url"):
+        #     blocks.append(text(
+        #         f"Everything that can be filled in here is done. Payment and placing the order happen on "
+        #         f"{merchant.name}'s own checkout page: "
+        #         f"[Continue to payment on {merchant.name}]({response['continue_url']})"
+        #     ))
         return blocks

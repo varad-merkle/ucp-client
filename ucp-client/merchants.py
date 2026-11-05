@@ -34,6 +34,7 @@ class Merchant:
     name: str
     url: str
     categories: list[str]
+    supported_countries: list[str] = field(default_factory=list)
     logo: str | None = None
     version: str | None = None
     endpoint: str | None = None
@@ -84,7 +85,8 @@ class Registry:
         self.merchants = {
             m["id"]: Merchant(id=m["id"], name=m["name"], url=m["url"].rstrip("/"),
                               categories=[c.strip().lower() for c in m["categories"]],
-                              logo=m.get("logo"))
+                              logo=m.get("logo"),
+                              supported_countries=[country.upper() for country in m.get("supported_countries", [])])
             for m in data["merchants"]
         }
         self.categories = sorted({c for m in self.merchants.values() for c in m.categories})
@@ -95,11 +97,20 @@ class Registry:
     def get(self, merchant_id: str | None) -> Merchant | None:
         return self.merchants.get(merchant_id or "")
 
-    def selling(self, categories: list[str]) -> list[Merchant]:
-        """Merchants selling any of these categories, most matching categories first."""
+    @staticmethod
+    def supporting_country(merchants: list[Merchant], country: str | None) -> list[Merchant]:
+        """Return merchants listed as supporting the buyer's country."""
+        if not country:
+            return merchants
+        country = country.strip().upper()
+        return [merchant for merchant in merchants if country in merchant.supported_countries]
+
+    def selling(self, categories: list[str], country: str | None = None) -> list[Merchant]:
+        """Country-supported merchants selling these categories, best matches first."""
         wanted = set(categories)
         matches = [(len(wanted & set(m.categories)), m) for m in self.merchants.values()]
-        return [m for count, m in sorted(matches, key=lambda pair: -pair[0]) if count]
+        category_matches = [m for count, m in sorted(matches, key=lambda pair: -pair[0]) if count]
+        return self.supporting_country(category_matches, country)
 
     async def discover_all(self, platform_profile: dict) -> None:
         await asyncio.gather(*(self.discover(m, platform_profile) for m in self.merchants.values()))
