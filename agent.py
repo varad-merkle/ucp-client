@@ -17,21 +17,44 @@ Configured with the dentsu AI gateway .env structure (see .env.example):
     CHAT_MODEL_NAME, AZURE_OPENAI_API_KEY, PROJECT, DEPLOYMENT
 """
 
+import asyncio
 import json
 import logging
 import os
+from typing import Any
 
 from openai import AsyncAzureOpenAI, OpenAIError
+from openai.types.chat import ChatCompletionFunctionToolParam
 
 from merchants import Registry
-from shop import (MAX_CATEGORIES, MAX_SEARCHES, STORE_KEY, Blocks, Session, Shop, cart_count, cart_state, delivery_group,
-                  dollars, money, notice, total_of)
+from shop import (
+    JSON,
+    MAX_CATEGORIES,
+    MAX_SEARCHES,
+    STORE_KEY,
+    Blocks,
+    Session,
+    Shop,
+    cart_count,
+    cart_state,
+    delivery_group,
+    dollars,
+    items,
+    money,
+    notice,
+    total_of,
+)
 
 logger = logging.getLogger("ucp-client")
 
 DEFAULT_DEPLOYMENT = "gpt-4.1"
 MAX_TOOL_ROUNDS = 6  # tool calls the model may chain for one message
 HISTORY_TURNS = 10  # earlier messages kept as context
+# Heroku drops a request that sends nothing back within 30 seconds (error H12), so a chat
+# turn stops in time to answer with a message of its own instead.
+CHAT_DEADLINE_SECONDS = float(os.getenv("CHAT_DEADLINE_SECONDS") or 25)
+MODEL_TIMEOUT_SECONDS = 20.0  # one call to the model
+TOO_SLOW = "That took longer than expected, so I stopped. Please try again, or ask for one thing at a time."
 GATEWAY_SETTINGS = ["MODEL_ENDPOINT", "api_version", "AZURE_OPENAI_API_KEY", "APIVERSION",
                     "SERVICE_LINE", "BRAND", "PROJECT"]
 
@@ -84,7 +107,7 @@ Limits:
 """
 
 
-def tool(name: str, description: str, **properties) -> dict:
+def tool(name: str, description: str, **properties: JSON) -> ChatCompletionFunctionToolParam:
     """A strict function tool: every property required, null allowed where optional."""
     return {
         "type": "function",
@@ -106,7 +129,7 @@ TEXT_OR_NULL = {"type": ["string", "null"]}
 NUMBER_OR_NULL = {"type": ["number", "null"]}
 
 
-def build_tools(registry: Registry) -> list[dict]:
+def build_tools(registry: Registry) -> list[ChatCompletionFunctionToolParam]:
     """The model's tools. Categories and stores can only be values from the registry."""
     store_or_null = {"type": ["string", "null"], "enum": [m.id for m in registry.all()] + [None]}
     return [
@@ -168,9 +191,9 @@ def price_cents(amount: float | None) -> int | None:
     return round(amount * 100) if amount is not None else None
 
 
-def product_summary(product: dict) -> dict:
+def product_summary(product: JSON) -> JSON:
     """What the model needs to know about a product (kept small)."""
-    variants = product.get("variants") or []
+    variants = items(product.get("variants"))
     return {
         "product_id": product["id"],
         "store": product.get(STORE_KEY),
@@ -180,19 +203,19 @@ def product_summary(product: dict) -> dict:
              "available": v.get("availability", {}).get("available", True)}
             for v in variants[:10]
         ],
-        "options": [{"name": o["name"], "values": [v["label"] for v in o.get("values") or []]}
-                    for o in product.get("options") or []],
+        "options": [{"name": o["name"], "values": [v["label"] for v in items(o.get("values"))]}
+                    for o in items(product.get("options"))],
     }
 
 
-def state_summary(session: Session) -> dict:
+def state_summary(session: Session) -> JSON:
     """The shopping state, sent to the model with every message."""
-    state = {
+    state: JSON = {
         "products_shown": [product_summary(p) for p in session.products],
         "product_open": product_summary(session.detail) if session.detail else None,
         "carts": [{"store": store_id,
                    "lines": [{"variant_id": line["item"]["id"], "title": line["item"].get("title"),
-                              "quantity": line["quantity"]} for line in cart.get("line_items") or []],
+                              "quantity": line["quantity"]} for line in items(cart.get("line_items"))],
                    "subtotal": dollars(total_of(cart.get("totals"), "subtotal"))}
                   for store_id, cart in session.carts.items()],
         "more_results": session.has_more(),
@@ -207,7 +230,7 @@ def state_summary(session: Session) -> dict:
             "details_given": {**session.buyer, **session.address},
             "delivery_options": [{"option_id": o["id"], "title": o.get("title"),
                                   "selected": o["id"] == group.get("selected_option_id")}
-                                 for o in group.get("options") or []],
+                                 for o in items(group.get("options"))],
             "total": dollars(total_of(checkout.get("totals"), "total")),
         }
     return state
@@ -219,20 +242,24 @@ def gateway_client() -> AsyncAzureOpenAI | None:
     if missing:
         logger.warning(f"dentsu AI gateway not configured (missing {', '.join(missing)}); the chat is unavailable")
         return None
-    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    # Every GATEWAY_SETTINGS name is set (checked above), so os.environ[...] cannot fail.
+    api_key = os.environ["AZURE_OPENAI_API_KEY"]
     return AsyncAzureOpenAI(
         api_key=api_key,
-        azure_endpoint=os.getenv("MODEL_ENDPOINT"),
-        api_version=os.getenv("api_version"),
+        azure_endpoint=os.environ["MODEL_ENDPOINT"],
+        api_version=os.environ["api_version"],
         # Mandatory headers for the dentsu AI gateway.
         default_headers={
-            "x-service-line": os.getenv("SERVICE_LINE"),
-            "x-brand": os.getenv("BRAND"),
-            "x-project": os.getenv("PROJECT"),
+            "x-service-line": os.environ["SERVICE_LINE"],
+            "x-brand": os.environ["BRAND"],
+            "x-project": os.environ["PROJECT"],
             "Cache-Control": "no-cache",
             "Ocp-Apim-Subscription-Key": api_key,
-            "api-version": os.getenv("APIVERSION"),
+            "api-version": os.environ["APIVERSION"],
         },
+        # The SDK default is 10 minutes and 2 retries; a chat turn has CHAT_DEADLINE_SECONDS in all.
+        timeout=MODEL_TIMEOUT_SECONDS,
+        max_retries=1,
     )
 
 
@@ -247,7 +274,7 @@ class Agent:
             logger.info(f"Chat runs on the dentsu AI gateway, deployment {self.model}")
 
     async def reply(self, message: str, session_id: str | None, username: str,
-                    request_signals: dict | None = None) -> dict:
+                    request_signals: JSON | None = None) -> JSON:
         """One chat turn for one logged-in user.
 
         request_signals carries IP/UA from the HTTP layer for UCP forwarding.
@@ -261,11 +288,16 @@ class Agent:
             text, blocks = "", [notice("error", "The assistant isn't configured. Set up the dentsu AI gateway in .env.")]
         else:
             try:
-                text, blocks = await self.run(message.strip(), session)
+                async with asyncio.timeout(CHAT_DEADLINE_SECONDS):
+                    text, blocks = await self.run(message.strip(), session)
+            except TimeoutError:
+                logger.warning(f"Chat turn stopped after {CHAT_DEADLINE_SECONDS:.0f} s")
+                text, blocks = "", [notice("warning", TOO_SLOW)]
             except OpenAIError as exc:
                 logger.warning(f"dentsu AI gateway error: {exc}")
                 text, blocks = "", [notice("error", "The assistant is unavailable right now. Try again in a moment.")]
-            except Exception as exc:  # a store call failed inside a tool
+            # Deliberately broad: a store call failed inside a tool, and the shopper is told why.
+            except Exception as exc:  # noqa: BLE001
                 if "rate limit" in str(exc).lower():
                     text, blocks = "", [notice("warning", "A store is getting too many requests right now. "
                                                           "Wait a few seconds and try again.")]
@@ -277,8 +309,8 @@ class Agent:
         blocks = ([{"type": "text", "text": text}] if text else []) + blocks
         return self.response(session, blocks)
 
-    async def submit_details(self, session_id: str | None, details: dict, username: str,
-                             request_signals: dict | None = None) -> dict:
+    async def submit_details(self, session_id: str | None, details: JSON, username: str,
+                             request_signals: JSON | None = None) -> JSON:
         """The checkout card's delivery details form: saved straight through the shop, no model call."""
         session = self.shop.session(session_id, username)
         if request_signals:
@@ -290,19 +322,22 @@ class Agent:
         return self.response(session, blocks)
 
     async def start_checkout(self, session_id: str | None, store_id: str, username: str,
-                             request_signals: dict | None = None) -> dict:
+                             request_signals: JSON | None = None) -> JSON:
         """A cart card's Checkout button: opens that store's checkout directly, no model call."""
         session = self.shop.session(session_id, username)
         if request_signals:
             session.signals = request_signals
         blocks = await self.shop.start_checkout(session, store_id)
-        name = self.shop.registry.get(store_id).name
+        merchant = self.shop.registry.get(store_id)
+        name = merchant.name if merchant else store_id
         # Tell the model on the next message which checkout was opened.
         session.history += [{"role": "user", "content": f"(Pressed Checkout on the {name} cart.)"},
                             {"role": "assistant", "content": f"Opened the {name} checkout."}]
         return self.response(session, blocks)
 
-    def response(self, session: Session, blocks: Blocks) -> dict:
+    def response(self, session: Session, blocks: Blocks) -> JSON:
+        """The reply for the frontend. Every request ends here, so this is where the session is saved."""
+        self.shop.save(session)
         return {"session_id": session.id, "blocks": blocks, "suggestions": self.suggestions(session),
                 "state": cart_state(session)}
 
@@ -316,7 +351,10 @@ class Agent:
 
     async def run(self, message: str, session: Session) -> tuple[str, Blocks]:
         """One shopper message: let the model call tools until it has a reply."""
-        messages: list = [
+        client = self.client
+        if client is None:  # reply() checks this first
+            raise RuntimeError("the chat model is not configured")
+        messages: list[Any] = [
             {"role": "system", "content": self.instructions()},
             *session.history[-HISTORY_TURNS:],
             {"role": "system", "content": "Current state: " + json.dumps(state_summary(session))},
@@ -327,29 +365,38 @@ class Agent:
         searched = False  # a later search this turn adds to the earlier results
 
         for _ in range(MAX_TOOL_ROUNDS):
-            response = await self.client.chat.completions.create(model=self.model, messages=messages, tools=self.tools)
+            response = await client.chat.completions.create(model=self.model, messages=messages, tools=self.tools)
             reply = response.choices[0].message
             if not reply.tool_calls:
                 text = (reply.content or "").strip()
                 break
             messages.append(reply.model_dump(exclude_none=True))
             for call in reply.tool_calls:
-                name, arguments = call.function.name, call.function.arguments
-                logger.info(f"LLM tool: {name} {arguments}")
-                blocks = await self.call(name, json.loads(arguments or "{}"), session, add_search=searched)
-                searched = searched or name == "search_products"
-                # Text blocks are for the model; the shopper sees the model's reply and the cards.
-                # Notices stay visible: UCP asks platforms to show the store's warnings and errors.
-                said = [b["text"] for b in blocks if b["type"] in ("text", "notice")]
-                ui = [b for b in blocks if b["type"] != "text"]
-                shown = [b for b in shown if b["type"] not in {x["type"] for x in ui}] + ui
-                result = {"result": said, "state": state_summary(session)}
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
+                if call.type == "function":  # only function tools are offered
+                    name = call.function.name
+                    shown = await self._use_tool(name, call.function.arguments, call.id, session, messages, shown,
+                                                 add_search=searched)
+                    searched = searched or name == "search_products"
 
         session.history += [{"role": "user", "content": message}, {"role": "assistant", "content": text}]
         return text, shown
 
-    async def call(self, name: str, args: dict, session: Session, add_search: bool = False) -> Blocks:
+    async def _use_tool(self, name: str, arguments: str, call_id: str, session: Session, messages: list[Any],
+                        shown: Blocks, add_search: bool) -> Blocks:
+        """Run one tool the model asked for, give the model its result, and return the cards to show."""
+        # Arguments can hold checkout details (name, email, phone, address): DEBUG only.
+        logger.info(f"LLM tool: {name}")
+        logger.debug(f"LLM tool: {name} {arguments}")
+        blocks = await self.call(name, json.loads(arguments or "{}"), session, add_search=add_search)
+        # Text blocks are for the model; the shopper sees the model's reply and the cards.
+        # Notices stay visible: UCP asks platforms to show the store's warnings and errors.
+        said = [b["text"] for b in blocks if b["type"] in ("text", "notice")]
+        ui = [b for b in blocks if b["type"] != "text"]
+        result = {"result": said, "state": state_summary(session)}
+        messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result)})
+        return [b for b in shown if b["type"] not in {x["type"] for x in ui}] + ui
+
+    async def call(self, name: str, args: JSON, session: Session, add_search: bool = False) -> Blocks:
         """Run one tool through the shop. add_search: an earlier search ran this turn; keep it."""
         shop = self.shop
         match name:
@@ -383,7 +430,8 @@ class Agent:
                 return await shop.view_checkout(session)
             case "cancel_checkout":
                 return await shop.cancel_checkout(session)
-        return [notice("error", f"Unknown tool {name}")]
+            case _:
+                return [notice("error", f"Unknown tool {name}")]
 
     @staticmethod
     def suggestions(session: Session) -> list[str]:

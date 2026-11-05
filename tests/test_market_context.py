@@ -66,7 +66,22 @@ def test_a_session_belongs_to_the_user_who_created_it():
     shop = make_shop()
     session = shop.session(None, USER)
     assert session.username == USER
-    assert shop.session(session.id, USER) is session
+    assert shop.session(session.id, USER).id == session.id
+
+
+def test_a_session_is_shared_by_every_worker_and_survives_a_restart():
+    """Sessions live in the database: another process (or the same one after a restart) carries on."""
+    first_worker, second_worker = make_shop(), make_shop()
+    session = first_worker.session(None, USER)
+    session.carts["pier1"] = {"id": "cart-1"}
+    session.buyer["email"] = "alex@example.com"
+    session.history.append({"role": "user", "content": "a sofa"})
+    first_worker.save(session)
+
+    again = second_worker.session(session.id, USER)
+    assert again.carts == {"pier1": {"id": "cart-1"}}
+    assert again.buyer == {"email": "alex@example.com"}
+    assert again.history == [{"role": "user", "content": "a sofa"}]
 
 
 def test_another_users_session_id_starts_a_fresh_session():
@@ -74,11 +89,13 @@ def test_another_users_session_id_starts_a_fresh_session():
     mine = shop.session(None, USER)
     mine.carts["pier1"] = {"id": "cart-1"}
 
+    shop.save(mine)
+
     theirs = shop.session(mine.id, OTHER_USER)
-    assert theirs is not mine
+    assert theirs.id != mine.id
     assert theirs.username == OTHER_USER
     assert theirs.carts == {}      # the other user's cart is not visible
-    assert mine.carts != {}        # and is left untouched
+    assert shop.session(mine.id, USER).carts == {"pier1": {"id": "cart-1"}}   # and is left untouched
 
 
 def test_an_unknown_session_id_starts_a_new_session():

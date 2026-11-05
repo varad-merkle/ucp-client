@@ -11,8 +11,10 @@ that already exists. When sign-up arrives it calls create_user() exactly as the
 bootstrap does, and nothing else here has to change.
 
 Passwords are stored as a salted PBKDF2 hash, never in plain text. Logging in
-returns a token; tokens are held in memory, so a restart logs everyone out and
-no token can outlive the process.
+returns a token. Tokens are kept in the app_session table, not in process memory,
+so every worker and dyno accepts the same tokens and a restart or deploy logs
+nobody out. Only a SHA-256 of each token is stored, so the table cannot be used
+to sign in.
 """
 
 import hashlib
@@ -26,8 +28,23 @@ logger = logging.getLogger("ucp-client")
 
 _HASH_ROUNDS = 200_000
 
-# Live tokens: token -> username. Cleared whenever the server restarts.
-_tokens: dict[str, str] = {}
+# A login lasts this long; then the frontend sends the user back to the login screen.
+LOGIN_HOURS = int(os.environ.get("LOGIN_HOURS") or 24 * 7)
+
+# Password guessing: failed logins allowed per account, and per IP address, within the window.
+# The counts are in the database, so they hold across every worker and restart.
+MAX_FAILURES_PER_ACCOUNT = 5
+MAX_FAILURES_PER_IP = 20
+FAILURE_WINDOW_MINUTES = 15
+
+
+class TooManyAttemptsError(Exception):
+    """Too many failed logins for this account or address. Try again after FAILURE_WINDOW_MINUTES."""
+
+
+def _token_key(token: str) -> str:
+    """What app_session stores for a token. Tokens are random, so a plain SHA-256 is enough."""
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -61,6 +78,20 @@ def init_auth() -> None:
                 password_hash  TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_session (
+                token_hash  TEXT PRIMARY KEY,
+                username    TEXT NOT NULL REFERENCES app_user (username) ON DELETE CASCADE,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS login_failure (
+                key        TEXT NOT NULL,          -- 'account:<username>' or 'ip:<address>'
+                failed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS login_failure_key ON login_failure (key, failed_at)")
 
     username = os.environ.get("DEMO_USER")
     password = os.environ.get("DEMO_PASSWORD")
@@ -75,9 +106,37 @@ def init_auth() -> None:
         logger.info(f"Account {username!r} already exists; .env left it unchanged")
 
 
-def login(username: str, password: str) -> str | None:
-    """Check the credentials and return a new token, or None if they do not match."""
+def _failure_limits(username: str, ip: str | None) -> list[tuple[str, int]]:
+    """The failure counters a login attempt counts against, with their limits."""
+    limits = [(f"account:{username}", MAX_FAILURES_PER_ACCOUNT)]
+    if ip:
+        limits.append((f"ip:{ip}", MAX_FAILURES_PER_IP))
+    return limits
+
+
+def _blocked(conn: db.Connection, limits: list[tuple[str, int]]) -> bool:
+    for key, limit in limits:
+        row = conn.execute(
+            "SELECT count(*) AS failures FROM login_failure WHERE key = %s AND failed_at > now() - make_interval(mins => %s)",
+            (key, FAILURE_WINDOW_MINUTES),
+        ).fetchone()
+        if row and row["failures"] >= limit:
+            return True
+    return False
+
+
+def login(username: str, password: str, ip: str | None = None) -> str | None:
+    """Check the credentials and return a new token, or None if they do not match.
+
+    Raises TooManyAttemptsError once this account, or this IP address, has failed too often
+    within FAILURE_WINDOW_MINUTES; the password is then not even checked.
+    """
+    limits = _failure_limits(username, ip)
     with db.connect() as conn:
+        conn.execute("DELETE FROM login_failure WHERE failed_at < now() - make_interval(mins => %s)",
+                     (FAILURE_WINDOW_MINUTES,))
+        if _blocked(conn, limits):
+            raise TooManyAttemptsError
         user = conn.execute("SELECT * FROM app_user WHERE username = %s", (username,)).fetchone()
 
     # Hash even when the user does not exist, so a wrong username and a wrong
@@ -85,23 +144,37 @@ def login(username: str, password: str) -> str | None:
     salt = user["password_salt"] if user else secrets.token_hex(16)
     expected = user["password_hash"] if user else ""
     if not secrets.compare_digest(_hash_password(password, salt), expected):
+        with db.connect() as conn:
+            for key, _ in limits:
+                conn.execute("INSERT INTO login_failure (key) VALUES (%s)", (key,))
         return None
 
     token = secrets.token_urlsafe(32)
-    _tokens[token] = username
+    with db.connect() as conn:
+        conn.execute("DELETE FROM login_failure WHERE key = %s", (limits[0][0],))   # this account starts afresh
+        conn.execute("DELETE FROM app_session WHERE created_at < now() - make_interval(hours => %s)", (LOGIN_HOURS,))
+        conn.execute("INSERT INTO app_session (token_hash, username) VALUES (%s, %s)", (_token_key(token), username))
     return token
 
 
 def username_for(token: str) -> str | None:
-    """The logged-in user for a token, or None if the token is unknown or logged out."""
-    return _tokens.get(token)
+    """The logged-in user for a token, or None if the token is unknown, expired or logged out."""
+    with db.connect() as conn:
+        row = conn.execute(
+            """SELECT username FROM app_session
+               WHERE token_hash = %s AND created_at > now() - make_interval(hours => %s)""",
+            (_token_key(token), LOGIN_HOURS),
+        ).fetchone()
+    return row["username"] if row else None
 
 
 def logout(token: str) -> None:
     """Invalidate a token. Logging out twice is not an error."""
-    _tokens.pop(token, None)
+    with db.connect() as conn:
+        conn.execute("DELETE FROM app_session WHERE token_hash = %s", (_token_key(token),))
 
 
 def logout_all() -> None:
     """Invalidate every token at once."""
-    _tokens.clear()
+    with db.connect() as conn:
+        conn.execute("DELETE FROM app_session")

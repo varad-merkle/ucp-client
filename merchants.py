@@ -13,6 +13,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -28,6 +29,10 @@ CHECKOUT = "dev.ucp.shopping.checkout"
 MIN_PROFILE_TTL = 60
 
 
+def _empty_profile_cache() -> dict[str, Any]:
+    return {"profile": None, "expires": 0.0}
+
+
 @dataclass
 class Merchant:
     id: str
@@ -37,14 +42,14 @@ class Merchant:
     logo: str | None = None
     version: str | None = None
     endpoint: str | None = None
-    capabilities: set[str] = field(default_factory=set)
+    capabilities: set[str] = field(default_factory=set[str])
     error: str | None = None
-    profile_cache: dict = field(default_factory=lambda: {"profile": None, "expires": 0.0})
+    profile_cache: dict[str, Any] = field(default_factory=_empty_profile_cache)
 
     def supports(self, capability: str) -> bool:
         return not self.error and capability in self.capabilities
 
-    async def profile(self) -> dict:
+    async def profile(self) -> dict[str, Any]:
         cache = self.profile_cache
         if cache["profile"] and time.monotonic() < cache["expires"]:
             return cache["profile"]
@@ -52,13 +57,13 @@ class Merchant:
         cache.update(profile=profile, expires=time.monotonic() + max(MIN_PROFILE_TTL, max_age))
         return profile
 
-    def summary(self) -> dict:
+    def summary(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "url": self.url, "categories": self.categories,
                 "version": self.version, "endpoint": self.endpoint,
                 "capabilities": sorted(self.capabilities), "error": self.error}
 
 
-async def fetch_profile(url: str) -> tuple[dict, int]:
+async def fetch_profile(url: str) -> tuple[dict[str, Any], int]:
     """A UCP profile and its Cache-Control max-age. UCP: never follow redirects for profiles."""
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as http:
         response = await http.get(url, headers={"Accept": "application/json"})
@@ -70,8 +75,8 @@ async def fetch_profile(url: str) -> tuple[dict, int]:
     return response.json(), int(max_age[1]) if max_age else 0
 
 
-def mcp_endpoint(profile: dict, version: str) -> str:
-    services = profile.get("ucp", {}).get("services", {}).get("dev.ucp.shopping", [])
+def mcp_endpoint(profile: dict[str, Any], version: str) -> str:
+    services: list[dict[str, Any]] = profile.get("ucp", {}).get("services", {}).get("dev.ucp.shopping", [])
     for service in services:
         if service.get("transport") == "mcp" and service.get("endpoint") and service.get("version", version) == version:
             return service["endpoint"].rstrip("/")
@@ -95,20 +100,27 @@ class Registry:
     def get(self, merchant_id: str | None) -> Merchant | None:
         return self.merchants.get(merchant_id or "")
 
+    def require(self, merchant_id: str | None) -> Merchant:
+        """The store with this id, for ids that must be known (taken from a cart, product or checkout)."""
+        merchant = self.get(merchant_id)
+        if merchant is None:
+            raise KeyError(f"Unknown store {merchant_id!r}")
+        return merchant
+
     def selling(self, categories: list[str]) -> list[Merchant]:
         """Merchants selling any of these categories, most matching categories first."""
         wanted = set(categories)
         matches = [(len(wanted & set(m.categories)), m) for m in self.merchants.values()]
         return [m for count, m in sorted(matches, key=lambda pair: -pair[0]) if count]
 
-    async def discover_all(self, platform_profile: dict) -> None:
+    async def discover_all(self, platform_profile: dict[str, Any]) -> None:
         await asyncio.gather(*(self.discover(m, platform_profile) for m in self.merchants.values()))
 
-    async def discover(self, merchant: Merchant, platform_profile: dict) -> None:
-        ours = platform_profile["ucp"]["version"]
+    async def discover(self, merchant: Merchant, platform_profile: dict[str, Any]) -> None:
+        ours: str = platform_profile["ucp"]["version"]
         try:
             profile = await merchant.profile()
-            version = profile["ucp"]["version"]
+            version: str = profile["ucp"]["version"]
             if version != ours and ours in (profile["ucp"].get("supported_versions") or {}):
                 # UCP: use the business's profile for our version, and check it says so.
                 profile, _ = await fetch_profile(profile["ucp"]["supported_versions"][ours])
@@ -121,7 +133,8 @@ class Registry:
             merchant.endpoint = mcp_endpoint(profile, version)
             merchant.capabilities = set(profile["ucp"].get("capabilities") or {}) & set(platform_profile["ucp"]["capabilities"])
             merchant.error = None
-        except Exception as exc:  # one store being down or incompatible must not stop the others
+        # Deliberately broad: one store being down or incompatible must not stop the others.
+        except Exception as exc:  # noqa: BLE001
             merchant.error = str(exc) or type(exc).__name__
         if merchant.error:
             logger.warning(f"Store {merchant.name}: unavailable ({merchant.error})")

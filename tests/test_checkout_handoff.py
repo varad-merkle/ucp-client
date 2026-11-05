@@ -52,9 +52,9 @@ def test_both_stores_continue_to_payment_on_their_own_page():
     assert autoxpert["continue_url"] == AUTOXPERT_URL
     assert "Continue to payment on Pier 1" in pier1_text
     assert "Continue to payment on Auto-Xpert" in autoxpert_text
-    # Pier 1's extra step is passed on; Auto-Xpert has none.
-    assert "extension interaction" in pier1_text
-    assert "also asks" not in autoxpert_text
+    # Pier 1's extra step is mentioned; Auto-Xpert has none.
+    assert "one more step" in pier1_text
+    assert "one more step" not in autoxpert_text
 
 
 def test_fixable_problems_come_first():

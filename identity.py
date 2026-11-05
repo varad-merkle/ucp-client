@@ -45,15 +45,21 @@ import re
 import secrets
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import quote_plus, urlencode, urlsplit
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
 import db
+from merchants import Merchant, Registry
+
+# A JSON object from an authorization server or a store profile.
+JSON = dict[str, Any]
 
 logger = logging.getLogger("ucp-client")
 
@@ -116,7 +122,7 @@ def _fernet() -> Fernet | None:
         return None
 
 
-def enabled(merchants) -> bool:
+def enabled(merchants: Iterable[Merchant]) -> bool:
     """On when tokens can be stored safely and at least one store has credentials."""
     return _fernet() is not None and any(store_credentials(m.id) for m in merchants)
 
@@ -142,14 +148,14 @@ def _shop_scopes() -> str:
     return _env("SHOP_ACCOUNTS_SCOPES") or DEFAULT_SHOP_SCOPES
 
 
-def chain_audience(merchant) -> str:
+def chain_audience(merchant: Merchant) -> str:
     """The token exchange audience for a store: its Shopify domain, as Shopify documents
     (the host of its MCP endpoint). IDENTITY_AUDIENCE=issuer sends the AS issuer instead,
     as the generic UCP spec words it."""
     return urlsplit(merchant.endpoint or merchant.url).netloc
 
 
-def client_metadata(public_url: str | None) -> dict:
+def client_metadata(public_url: str | None) -> JSON:
     """Our Client ID Metadata Document: who we are, for servers that accept a URL as client_id."""
     return {
         "client_id": shop_client_id(public_url),
@@ -184,32 +190,51 @@ def init_identity() -> None:
                 PRIMARY KEY (username, target)
             )
         """)
+        # Browser links waiting for the callback. Kept here, not in memory, so the callback
+        # may reach any worker or dyno, and a restart does not lose a sign-in in progress.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS identity_pending (
+                state_hash    TEXT PRIMARY KEY,       -- SHA-256 of the OAuth state
+                username      TEXT NOT NULL REFERENCES app_user(username) ON DELETE CASCADE,
+                target        TEXT NOT NULL,
+                issuer        TEXT NOT NULL,
+                verifier      TEXT NOT NULL,          -- PKCE code_verifier, Fernet ciphertext
+                redirect_uri  TEXT NOT NULL,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
     key = _env("IDENTITY_TOKEN_KEY")
     if key and not _fernet():
         logger.error("IDENTITY_TOKEN_KEY is not a valid Fernet key: identity linking is off")
 
 
 def _encrypt(value: str | None) -> str | None:
-    return _fernet().encrypt(value.encode()).decode() if value else None
+    if not value:
+        return None
+    fernet = _fernet()
+    if fernet is None:
+        raise RuntimeError("IDENTITY_TOKEN_KEY is missing or invalid: tokens cannot be stored")
+    return fernet.encrypt(value.encode()).decode()
 
 
 def _decrypt(value: str | None) -> str | None:
-    if not value:
-        return None
+    fernet = _fernet()
+    if not value or fernet is None:
+        return None  # key removed: treat as not linked
     try:
-        return _fernet().decrypt(value.encode()).decode()
-    except (InvalidToken, AttributeError):
-        return None  # key changed or removed: treat as not linked
+        return fernet.decrypt(value.encode()).decode()
+    except InvalidToken:
+        return None  # key changed: treat as not linked
 
 
-def _load(username: str, target: str) -> dict | None:
+def _load(username: str, target: str) -> db.Row | None:
     with db.connect() as conn:
         return conn.execute(
             "SELECT * FROM identity_link WHERE username = %s AND target = %s", (username, target)
         ).fetchone()
 
 
-def _links(username: str) -> list[dict]:
+def _links(username: str) -> list[db.Row]:
     with db.connect() as conn:
         return conn.execute("SELECT * FROM identity_link WHERE username = %s", (username,)).fetchall()
 
@@ -220,14 +245,14 @@ def _jwt_expiry(token: str) -> datetime | None:
     try:
         payload = token.split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        return datetime.fromtimestamp(int(claims["exp"]), timezone.utc)
+        return datetime.fromtimestamp(int(claims["exp"]), UTC)
     except (IndexError, ValueError, KeyError, TypeError):
         return None
 
 
-def _save(username: str, target: str, via: str, issuer: str, tokens: dict, account: str | None = None) -> None:
+def _save(username: str, target: str, via: str, issuer: str, tokens: JSON, account: str | None = None) -> None:
     expires_in = tokens.get("expires_in")
-    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(expires_in)) if expires_in
+    expires_at = (datetime.now(UTC) + timedelta(seconds=int(expires_in)) if expires_in
                   else _jwt_expiry(tokens["access_token"]))
     with db.connect() as conn:
         conn.execute(
@@ -262,7 +287,7 @@ def invalidate(username: str, target: str) -> None:
 
 # --------------------------------------------------------------- discovery
 
-_metadata_cache: dict[str, tuple[float, dict]] = {}
+_metadata_cache: dict[str, tuple[float, JSON]] = {}
 
 
 def _client() -> httpx.AsyncClient:
@@ -277,7 +302,7 @@ def _well_known(url: str, suffix: str) -> str:
     return f"{parts.scheme}://{parts.netloc}/.well-known/{suffix}{path}"
 
 
-async def _get_json(url: str) -> tuple[int, dict | None]:
+async def _get_json(url: str) -> tuple[int, JSON | None]:
     try:
         async with _client() as http:
             response = await http.get(url, headers={"Accept": "application/json"})
@@ -291,7 +316,7 @@ async def _get_json(url: str) -> tuple[int, dict | None]:
     return response.status_code, None
 
 
-async def authorization_server(issuer: str) -> dict:
+async def authorization_server(issuer: str) -> JSON:
     """The authorization server's metadata, per the UCP discovery rules."""
     cached = _metadata_cache.get(issuer)
     if cached and time.monotonic() < cached[0]:
@@ -321,25 +346,31 @@ async def store_issuer(store_url: str) -> str:
         return f"{parts.scheme}://{parts.netloc}"
     if metadata is None:
         raise IdentityError(f"protected resource metadata for {store_url} failed with HTTP {status}")
-    servers = metadata.get("authorization_servers") or []
+    servers: list[str] = metadata.get("authorization_servers") or []
     if not servers:
         raise IdentityError(f"{url} lists no authorization_servers")
     return servers[0]
 
 
-async def _linking_config(merchant) -> dict:
+async def _linking_config(merchant: Merchant) -> JSON:
     """The store's identity_linking config block from its UCP profile ({} if none)."""
-    entries = ((await merchant.profile()).get("ucp", {}).get("capabilities") or {}).get(CAPABILITY) or []
-    return (entries[0].get("config") or {}) if entries else {}
+    profile = await merchant.profile()
+    capabilities: JSON = profile.get("ucp", {}).get("capabilities") or {}
+    entries: list[JSON] = capabilities.get(CAPABILITY) or []
+    if not entries:
+        return {}
+    config: JSON = entries[0].get("config") or {}
+    return config
 
 
-def derived_scopes(config: dict, negotiated: set[str]) -> str:
+def derived_scopes(config: JSON, negotiated: set[str]) -> str:
     """UCP Scope Derivation: config.scopes limited to capabilities we negotiated with the store."""
-    scopes = [s for s in (config.get("scopes") or {}) if s.split(":", 1)[0] in negotiated]
+    offered: Iterable[str] = config.get("scopes") or {}
+    scopes = [s for s in offered if s.split(":", 1)[0] in negotiated]
     return " ".join(sorted(scopes))
 
 
-def _store_scope(username: str, merchant, config: dict) -> str:
+def _store_scope(username: str, merchant: Merchant, config: JSON) -> str:
     """What to ask a store for: the UCP derived set, scopes a 403 told us we lack, and
     SHOPIFY_STORE_SCOPES (default: what Shopify documents for buyer-linked tokens)."""
     wanted = set(derived_scopes(config, merchant.capabilities).split())
@@ -348,8 +379,9 @@ def _store_scope(username: str, merchant, config: dict) -> str:
     return " ".join(sorted(wanted))
 
 
-def _trusts_shop(config: dict, own_issuer: str) -> bool:
-    for entries in (config.get("providers") or {}).values():
+def _trusts_shop(config: JSON, own_issuer: str) -> bool:
+    providers: dict[str, list[JSON] | None] = config.get("providers") or {}
+    for entries in providers.values():
         for entry in entries or []:
             auth_url = (entry.get("auth_url") or "").rstrip("/")
             # A provider pointing back at the store's own server must be ignored.
@@ -361,14 +393,14 @@ def _trusts_shop(config: dict, own_issuer: str) -> bool:
 # ----------------------------------------------------------- token endpoint
 
 
-def _client_auth(target: str, metadata: dict, data: dict) -> httpx.BasicAuth | None:
+def _client_auth(target: str, metadata: JSON, data: dict[str, str]) -> httpx.BasicAuth | None:
     """Authenticate as our client, with the strongest method both sides support.
 
     Both are confidential-client secrets, so client_secret_post (what Shopify's docs
     show) is used when offered, else client_secret_basic. Shop accounts without any
     secret falls back to a public client ("none") whose proof is PKCE.
     """
-    methods = metadata.get("token_endpoint_auth_methods_supported") or ["client_secret_basic"]
+    methods: list[str] = metadata.get("token_endpoint_auth_methods_supported") or ["client_secret_basic"]
     if target == SHOP:
         client_id = shop_client_id(_public_url)
         secret = _shop_secret()
@@ -391,8 +423,8 @@ def _client_auth(target: str, metadata: dict, data: dict) -> httpx.BasicAuth | N
     raise IdentityError(f"no supported client authentication method among {methods}")
 
 
-async def _token_request(target: str, metadata: dict, data: dict) -> dict:
-    auth = _client_auth(target, metadata, data)
+async def _token_request(target: str, metadata: JSON, data: dict[str, str]) -> JSON:
+    auth = _client_auth(target, metadata, data) or httpx.USE_CLIENT_DEFAULT   # the client has no auth of its own
     try:
         async with _client() as http:
             response = await http.post(
@@ -400,6 +432,7 @@ async def _token_request(target: str, metadata: dict, data: dict) -> dict:
             )
     except httpx.HTTPError as exc:
         raise IdentityError(f"token endpoint unreachable: {exc}") from exc
+    body: JSON
     try:
         body = response.json()
     except ValueError:
@@ -421,10 +454,45 @@ class _Pending:
     issuer: str
     verifier: str
     redirect_uri: str
-    created: float = field(default_factory=time.monotonic)
 
 
-_pending: dict[str, _Pending] = {}
+def _state_key(state: str) -> str:
+    return hashlib.sha256(state.encode()).hexdigest()
+
+
+def _save_pending(state: str, pending: _Pending) -> None:
+    """Remember a started link until its callback, dropping links that were never finished."""
+    with db.connect() as conn:
+        conn.execute("DELETE FROM identity_pending WHERE created_at < now() - make_interval(secs => %s)",
+                     (STATE_TTL,))
+        conn.execute(
+            """INSERT INTO identity_pending (state_hash, username, target, issuer, verifier, redirect_uri)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (_state_key(state), pending.username, pending.target, pending.issuer,
+             _encrypt(pending.verifier), pending.redirect_uri),
+        )
+
+
+def _take_pending(state: str | None) -> _Pending | None:
+    """The link this callback finishes, or None if it is unknown or expired.
+
+    Deleted in the same statement that reads it, so a state works once even when two
+    callbacks reach different workers at the same time.
+    """
+    if not state:
+        return None
+    with db.connect() as conn:
+        row = conn.execute(
+            """DELETE FROM identity_pending WHERE state_hash = %s
+               RETURNING *, created_at >= now() - make_interval(secs => %s) AS fresh""",
+            (_state_key(state), STATE_TTL),
+        ).fetchone()
+    verifier = _decrypt(row["verifier"]) if row else None
+    if not row or not row["fresh"] or not verifier:
+        return None
+    return _Pending(row["username"], row["target"], row["issuer"], verifier, row["redirect_uri"])
+
+
 _public_url: str | None = None   # set by client.py at startup
 _chain_failures: dict[tuple[str, str], tuple[float, str]] = {}
 _needed_scopes: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -446,11 +514,8 @@ def pkce_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
 
 
-async def start_link(username: str, target: str, registry) -> str:
+async def start_link(username: str, target: str, registry: Registry) -> str:
     """Begin a browser link to Shop accounts or one store; returns the URL to send the browser to."""
-    for state in [s for s, p in _pending.items() if time.monotonic() - p.created > STATE_TTL]:
-        del _pending[state]
-
     if target == SHOP:
         issuer = SHOP_ISSUER
         client_id = shop_client_id(_public_url)
@@ -470,7 +535,7 @@ async def start_link(username: str, target: str, registry) -> str:
     verifier, challenge = pkce_pair()
     state = secrets.token_urlsafe(32)
     callback = redirect_uri(_public_url)
-    _pending[state] = _Pending(username, target, issuer, verifier, callback)
+    _save_pending(state, _Pending(username, target, issuer, verifier, callback))
 
     params = {
         "response_type": "code",
@@ -487,10 +552,10 @@ async def start_link(username: str, target: str, registry) -> str:
 
 
 async def finish_link(state: str | None, code: str | None, iss: str | None,
-                      error: str | None, registry) -> tuple[str, str]:
+                      error: str | None, registry: Registry) -> tuple[str, str]:
     """Complete a browser link from the callback. Returns (username, target)."""
-    pending = _pending.pop(state or "", None)   # single use, whatever happens next
-    if not pending or time.monotonic() - pending.created > STATE_TTL:
+    pending = _take_pending(state)   # single use, whatever happens next
+    if not pending:
         raise IdentityError("this link request is unknown or has expired; start again")
     if error:
         raise IdentityError(f"the sign-in was not completed ({error})", error)
@@ -522,7 +587,7 @@ async def finish_link(state: str | None, code: str | None, iss: str | None,
     return pending.username, pending.target
 
 
-async def _account_label(metadata: dict, access_token: str) -> str | None:
+async def _account_label(metadata: JSON, access_token: str) -> str | None:
     """The Shop account's email, to show which account is linked. Optional."""
     endpoint = metadata.get("userinfo_endpoint")
     if not endpoint:
@@ -535,7 +600,7 @@ async def _account_label(metadata: dict, access_token: str) -> str | None:
         return None
 
 
-async def chain(username: str, merchant) -> bool:
+async def chain(username: str, merchant: Merchant) -> bool:
     """Link one store from the user's Shop link (Accelerated IdP Flow). True on success."""
     key = (username, merchant.id)
     try:
@@ -560,7 +625,7 @@ async def chain(username: str, merchant) -> bool:
         if exchanged.get("issued_token_type") != JWT_TOKEN_TYPE:
             raise IdentityError(f"Shop accounts issued {exchanged.get('issued_token_type')!r}, not a JWT grant")
 
-        data = {"grant_type": JWT_BEARER, "assertion": exchanged["access_token"]}
+        data: dict[str, str] = {"grant_type": JWT_BEARER, "assertion": exchanged["access_token"]}
         scope = _store_scope(username, merchant, config)
         if scope:
             data["scope"] = scope
@@ -577,21 +642,21 @@ async def chain(username: str, merchant) -> bool:
         return False
 
 
-async def chain_all(username: str, registry) -> None:
+async def chain_all(username: str, registry: Registry) -> None:
     targets = [m for m in registry.all() if linkable(m)]
     await asyncio.gather(*(chain(username, m) for m in targets))
 
 
-def linkable(merchant) -> bool:
+def linkable(merchant: Merchant) -> bool:
     return merchant.supports(CAPABILITY) and store_credentials(merchant.id) is not None
 
 
 # ------------------------------------------------------------- token use
 
 
-def _expired(row: dict) -> bool:
-    expires = row.get("expires_at")
-    return expires is not None and expires - timedelta(seconds=REFRESH_MARGIN) <= datetime.now(timezone.utc)
+def _expired(row: db.Row) -> bool:
+    expires: datetime | None = row.get("expires_at")
+    return expires is not None and expires - timedelta(seconds=REFRESH_MARGIN) <= datetime.now(UTC)
 
 
 async def access_token(username: str, target: str) -> str | None:
@@ -629,7 +694,7 @@ async def access_token(username: str, target: str) -> str | None:
         return None
 
 
-async def bearer_for(username: str | None, merchant) -> str | None:
+async def bearer_for(username: str | None, merchant: Merchant) -> str | None:
     """The store token to send on this user's calls to this store, or None for a guest call."""
     if not username or not linkable(merchant) or _fernet() is None:
         return None
@@ -663,7 +728,7 @@ async def _revoke(target: str, issuer: str, token: str | None, hint: str) -> Non
         if not endpoint:
             return
         data = {"token": token, "token_type_hint": hint}
-        auth = _client_auth(target, metadata, data)
+        auth = _client_auth(target, metadata, data) or httpx.USE_CLIENT_DEFAULT
         async with _client() as http:
             response = await http.post(endpoint, data=data, auth=auth)
         if not response.is_success:
@@ -695,12 +760,12 @@ async def unlink(username: str, target: str) -> None:
 # ------------------------------------------------------------------ status
 
 
-def status(username: str, registry) -> dict:
+def status(username: str, registry: Registry) -> JSON:
     """What the frontend shows: whether linking is on, the Shop link, and each store."""
     is_enabled = enabled(registry.all())
-    links = {row["target"]: row for row in _links(username)} if is_enabled else {}
+    links: dict[str, db.Row] = {row["target"]: row for row in _links(username)} if is_enabled else {}
     shop = links.get(SHOP)
-    stores = []
+    stores: list[JSON] = []
     for merchant in registry.all():
         link = links.get(merchant.id)
         failure = _chain_failures.get((username, merchant.id))

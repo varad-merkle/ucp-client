@@ -8,6 +8,7 @@ import auth
 import db
 import identity
 import profile_store
+import shop
 
 load_dotenv()
 
@@ -27,15 +28,16 @@ def database(monkeypatch):
     monkeypatch.delenv("DEMO_PASSWORD", raising=False)
 
     schema = f"test_{uuid.uuid4().hex}"
-    with psycopg.connect(**db.settings(), autocommit=True) as conn:
+    with psycopg.connect(db.conninfo(), autocommit=True) as conn:
         conn.execute(f'CREATE SCHEMA "{schema}"')
     monkeypatch.setattr(db, "SCHEMA", schema)
     auth.init_auth()      # accounts first: a profile references its user
     profile_store.init_db()
     identity.init_identity()
+    shop.init_sessions()
     auth.create_user(USER, PASSWORD)
     auth.create_user(OTHER_USER, OTHER_PASSWORD)
     yield
-    auth.logout_all()     # tokens live in memory, so they outlast the schema
-    with psycopg.connect(**db.settings(), autocommit=True) as conn:
+    db.close_pools()      # its connections point at this test's schema
+    with psycopg.connect(db.conninfo(), autocommit=True) as conn:
         conn.execute(f'DROP SCHEMA "{schema}" CASCADE')

@@ -137,7 +137,7 @@ def servers(monkeypatch):
                  "IDENTITY_REDIRECT_URI"):
         monkeypatch.delenv(name, raising=False)
     identity.set_public_url(AGENT)
-    for cache in (identity._pending, identity._metadata_cache, identity._chain_failures, identity._needed_scopes):
+    for cache in (identity._metadata_cache, identity._chain_failures, identity._needed_scopes):
         cache.clear()
     return fake
 
